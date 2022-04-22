@@ -14,8 +14,8 @@ int main()
     {amount = 100 + ((unit-150) * 1.20);}
     else
     {amount = 220 + ((unit-250) * 1.50);}
-    surcharge = amt * 0.20;
-    totalamount  = amt + surcharge;
+    surcharge = amount * 0.20;
+    totalamount  = amount + surcharge;
     printf("Electricity Bill = Rs. %.2f", totalamount);
     return 0;
 }
