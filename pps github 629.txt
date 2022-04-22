@@ -3,7 +3,7 @@
 int main()
 {
     int unit;
-    float amt, totalamount, surcharge;
+    float amount, totalamount, surcharge;
     printf("Enter total units consumed: ");
     scanf("%d", &unit);
     if(unit <= 50)
