@@ -1,3 +1,4 @@
+// RA2111003011629 LAKSHYA RAJ VIJAY
 // SENARIO BASED MINI PROJECT
 //c program to encrypt, decrypt and masking of a password
 #include <stdio.h>
@@ -38,4 +39,4 @@ int main()
     decrypt(password,0xAED);
     printf("Decrypted value = %s\n",password);
     return 0;
-}
+}//RA2111003011629 LAKSHYA RAJ VIJAY
