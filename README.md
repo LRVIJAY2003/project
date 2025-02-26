@@ -787,1840 +787,957 @@ class DocumentProcessor:
         # Extract basic text content
         with open(file_path, 'rb') as f:
             pdf_reader = PyPDF2.PdfReader(f)
-            content = ''
             metadata = {
                 "page_count": len(pdf_reader.pages),
-                "file_size_kb": os.path.getsize(file_path) // 1024
+                "pdf_info": {}
             }
             
-            # Extract document info if available
+            # Extract PDF metadata if available
             if pdf_reader.metadata:
-                try:
-                    metadata.update({
-                        "title": pdf_reader.metadata.get("/Title", "Unknown"),
-                        "author": pdf_reader.metadata.get("/Author", "Unknown"),
-                        "creator": pdf_reader.metadata.get("/Creator", "Unknown"),
-                        "producer": pdf_reader.metadata.get("/Producer", "Unknown")
-                    })
-                except:
-                    pass
+                for key, value in pdf_reader.metadata.items():
+                    if key.startswith('/'):
+                        clean_key = key[1:]  # Remove the leading slash
+                    else:
+                        clean_key = key
+                    metadata["pdf_info"][clean_key] = str(value)
             
-            # Extract text content from each page
+            # Extract text content
+            content = ""
             for page_num in range(len(pdf_reader.pages)):
-                page_text = pdf_reader.pages[page_num].extract_text() or ""
-                content += page_text + "\n\n"
+                page_text = pdf_reader.pages[page_num].extract_text()
+                if page_text:
+                    content += page_text + "\n\n"
         
         # Extract tables if enabled
-        tables_extracted = False
+        tables = []
         if self.table_extraction_enabled:
             try:
                 # Use camelot to extract tables
-                tables = camelot.read_pdf(file_path, pages='all')
-                if len(tables) > 0:
-                    tables_extracted = True
+                table_dfs = camelot.read_pdf(file_path, pages='all')
+                
+                for i, table in enumerate(table_dfs):
+                    df = table.df
+                    # Convert dataframe to markdown table
+                    table_str = df.to_markdown(index=False)
+                    tables.append(f"Table {i+1}:\n{table_str}")
+                
+                if tables:
+                    content += "\n\n" + "\n\n".join(tables)
                     metadata["table_count"] = len(tables)
-                    
-                    # Add tables to content
-                    content += "\n\n--- TABLES ---\n\n"
-                    for i, table in enumerate(tables):
-                        # Convert to markdown format for better readability
-                        table_df = table.df
-                        content += f"Table {i+1}:\n"
-                        content += table_df.to_markdown(index=False) if hasattr(table_df, 'to_markdown') else table_df.to_string(index=False)
-                        content += "\n\n"
             except Exception as e:
                 logger.warning(f"Error extracting tables from PDF: {str(e)}")
         
-        # Extract text from images if OCR is enabled and we don't have much text content
-        if self.multimodal_enabled and (len(content.strip()) < 1000 or "scanned" in file_path.lower()):
+        # Extract text from images if OCR is enabled
+        if self.multimodal_enabled:
             try:
                 # Convert PDF pages to images
                 images = pdf2image.convert_from_path(file_path)
                 
-                # Perform OCR on each image
-                ocr_text = []
+                image_texts = []
                 for i, img in enumerate(images):
-                    # Skip if we already have a lot of text from this page
-                    existing_page_text = pdf_reader.pages[i].extract_text() if i < len(pdf_reader.pages) else ""
-                    if len(existing_page_text) > 500:  # Skip if we already have substantial text
-                        continue
-                        
-                    # Perform OCR
-                    text = pytesseract.image_to_string(img)
-                    if text.strip():
-                        ocr_text.append(f"[OCR Page {i+1}]: {text}")
-                
-                if ocr_text:
-                    content += "\n\n--- OCR EXTRACTED TEXT ---\n\n"
-                    content += "\n\n".join(ocr_text)
-                    metadata["ocr_applied"] = True
-                    metadata["ocr_page_count"] = len(ocr_text)
-            except Exception as e:
-                logger.warning(f"Error performing OCR on PDF: {str(e)}")
-        
-        # Extract image descriptions if content is short
-        if self.multimodal_enabled and len(content.strip()) < 2000:
-            try:
-                # Convert PDF pages to images if not already done
-                if not 'images' in locals():
-                    images = pdf2image.convert_from_path(file_path)
-                
-                # Add basic image descriptions
-                image_descriptions = []
-                for i, img in enumerate(images):
-                    # Get image properties
-                    width, height = img.size
-                    # Analyze colors
-                    colors = img.getcolors(maxcolors=256)
-                    is_grayscale = all(r == g == b for _, (r, g, b) in colors) if colors else False
-                    color_mode = "grayscale" if is_grayscale else "color"
+                    # Use OCR to extract text from image
+                    img_text = pytesseract.image_to_string(img)
                     
-                    description = f"[Image {i+1}]: {width}x{height} {color_mode} image"
-                    image_descriptions.append(description)
+                    # Only add if OCR found meaningful text (more than just noise)
+                    if len(img_text.strip()) > 20:  # Arbitrary threshold to filter out noise
+                        image_texts.append(f"Image {i+1} text: {img_text}")
                 
-                if image_descriptions:
-                    content += "\n\n--- IMAGES ---\n\n"
-                    content += "\n".join(image_descriptions)
-                    metadata["image_count"] = len(image_descriptions)
+                if image_texts:
+                    content += "\n\n" + "\n\n".join(image_texts)
+                    metadata["ocr_processed"] = True
+                    metadata["image_count"] = len(images)
             except Exception as e:
-                logger.warning(f"Error extracting image information from PDF: {str(e)}")
+                logger.warning(f"Error extracting text from PDF images: {str(e)}")
         
         return Document(doc_id=doc_id, file_path=file_path, content=content, metadata=metadata)
-        
-    def extract_key_terms(self, text: str) -> List[str]:
-        """Extract key terms from text."""
-        if not text or len(text.strip()) == 0:
-            return []
-            
-        try:
-            # Limit text length to avoid memory issues
-            text = text[:50000]
-            doc = nlp(text)
-            
-            # Extract noun phrases and entities
-            key_terms = []
-            
-            # Get named entities
-            for ent in doc.ents:
-                if ent.label_ in ('ORG', 'PRODUCT', 'GPE', 'PERSON', 'WORK_OF_ART', 'EVENT'):
-                    key_terms.append(ent.text)
-            
-            # Get noun phrases
-            for chunk in doc.noun_chunks:
-                # Only include multi-word phrases or important single nouns
-                if len(chunk.text.split()) > 1 or (chunk.root.pos_ == 'NOUN' and chunk.root.tag_ not in ('NN', 'NNS')):
-                    key_terms.append(chunk.text)
-            
-            # Extract technical terms using POS patterns
-            technical_patterns = [
-                [{'POS': 'ADJ'}, {'POS': 'NOUN'}],  # e.g., "neural network"
-                [{'POS': 'NOUN'}, {'POS': 'NOUN'}],  # e.g., "database system"
-                [{'POS': 'PROPN'}, {'POS': 'PROPN'}]  # e.g., "Google Cloud"
-            ]
-            
-            from spacy.matcher import Matcher
-            matcher = Matcher(nlp.vocab)
-            for i, pattern in enumerate(technical_patterns):
-                matcher.add(f"TECH_{i}", [pattern])
-            
-            matches = matcher(doc)
-            for match_id, start, end in matches:
-                span = doc[start:end]
-                if span.text.lower() not in STOPWORDS and len(span.text) > 3:
-                    key_terms.append(span.text)
-            
-            # Remove duplicates and sort by length (longer terms first)
-            key_terms = list(set(key_terms))
-            key_terms.sort(key=lambda x: len(x), reverse=True)
-            
-            return key_terms[:10]  # Return top 10 terms
-            
-        except Exception as e:
-            logger.error(f"Error extracting key terms: {str(e)}")
-            return []
 
 
-class VectorStore:
+class SemanticIndexer:
     """
-    Manages vector embeddings and similarity search for document chunks.
-    Supports multiple embedding methods and efficient retrieval.
+    Creates and manages semantic indexes for document chunks, supporting both
+    vector-based and lexical search capabilities.
     """
     
-    def __init__(self, embedding_dim=384):
-        """
-        Initialize the vector store.
+    def __init__(self, use_faiss=True):
+        """Initialize the semantic indexer."""
+        self.chunks = []  # All document chunks
+        self.doc_id_to_chunks = {}  # Mapping from doc_id to list of chunk indexes
+        self.chunk_id_to_index = {}  # Mapping from chunk_id to index in self.chunks
         
-        Args:
-            embedding_dim: Dimension of the embedding vectors
-        """
-        self.embedding_dim = embedding_dim
-        self.documents = {}  # Map of doc_id to Document
-        self.chunks = {}  # Map of chunk_id to DocumentChunk
-        self.chunk_embeddings = {}  # Map of chunk_id to embedding vector
+        # Embedding-based search components
+        self.use_sentence_transformers = sentence_transformers_available
+        self.use_faiss = use_faiss and faiss_available
         
-        # Set embedding method based on available packages
-        if sentence_transformers_available:
-            self.embedding_method = "sentence_transformers"
+        if self.use_sentence_transformers:
             self.sentence_model = sentence_model
         else:
-            self.embedding_method = "tfidf"
+            # Fallback to TF-IDF
             self.vectorizer = TfidfVectorizer(stop_words='english')
-            self.tfidf_matrix = None
-            self.tfidf_features = None
         
-        # Initialize FAISS index if available
-        self.use_faiss = faiss_available
-        self.index = None
-        self.chunk_ids = []  # To maintain order for FAISS
-    
-    def add_documents(self, documents: List[Document]):
-        """
-        Add documents to the vector store and compute embeddings for their chunks.
+        # Sparse vector indexes (TF-IDF)
+        self.tfidf_vectorizer = TfidfVectorizer(stop_words='english')
+        self.tfidf_matrix = None
         
-        Args:
-            documents: List of Document objects to add
-        """
-        # Add new documents to the store
-        new_chunks = []
-        for doc in documents:
-            self.documents[doc.id] = doc
-            for chunk in doc.chunks:
-                self.chunks[chunk.id] = chunk
-                new_chunks.append(chunk)
-        
-        # Compute embeddings for new chunks
-        self._compute_embeddings(new_chunks)
-        
-        # Rebuild index if using FAISS
-        if self.use_faiss:
-            self._build_faiss_index()
-    
-    def _compute_embeddings(self, chunks: List[DocumentChunk]):
-        """
-        Compute embeddings for document chunks.
-        
-        Args:
-            chunks: List of DocumentChunk objects
-        """
-        if not chunks:
-            return
-            
-        # Get texts from chunks
-        texts = [chunk.text for chunk in chunks]
-        
-        # Compute embeddings based on selected method
-        if self.embedding_method == "sentence_transformers":
-            embeddings = self.sentence_model.encode(texts)
-            
-            # Store embeddings
-            for i, chunk in enumerate(chunks):
-                chunk.embedding = embeddings[i]
-                self.chunk_embeddings[chunk.id] = embeddings[i]
-        else:
-            # If this is the first batch, fit the vectorizer
-            if self.tfidf_matrix is None:
-                self.tfidf_matrix = self.vectorizer.fit_transform(texts)
-                self.tfidf_features = self.vectorizer.get_feature_names_out()
-                
-                # Store embeddings
-                for i, chunk in enumerate(chunks):
-                    chunk.embedding = self.tfidf_matrix[i]
-                    self.chunk_embeddings[chunk.id] = self.tfidf_matrix[i]
-            else:
-                # Transform new texts using the existing vectorizer
-                new_tfidf = self.vectorizer.transform(texts)
-                
-                # Store embeddings
-                for i, chunk in enumerate(chunks):
-                    chunk.embedding = new_tfidf[i]
-                    self.chunk_embeddings[chunk.id] = new_tfidf[i]
-    
-    def _build_faiss_index(self):
-        """Build a FAISS index from the chunk embeddings."""
-        if not self.use_faiss or not self.chunk_embeddings:
-            return
-            
-        # Get all chunk IDs and embeddings
-        self.chunk_ids = list(self.chunk_embeddings.keys())
-        if self.embedding_method == "sentence_transformers":
-            embeddings = np.array([self.chunk_embeddings[cid] for cid in self.chunk_ids], dtype=np.float32)
-        else:
-            # Convert sparse matrix to dense for FAISS
-            embeddings = np.array([self.chunk_embeddings[cid].toarray()[0] for cid in self.chunk_ids], dtype=np.float32)
-        
-        # Create and train the index
-        self.index = faiss.IndexFlatIP(embeddings.shape[1])  # Inner product (cosine on normalized vectors)
-        
-        # Normalize vectors for cosine similarity
-        faiss.normalize_L2(embeddings)
-        
-        # Add to index
-        self.index.add(embeddings)
-    
-    def similarity_search(self, query: str, k: int = 5, filter_func=None) -> List[Tuple[DocumentChunk, float]]:
-        """
-        Perform a similarity search for the query.
-        
-        Args:
-            query: Query text
-            k: Number of top results to return
-            filter_func: Optional function to filter chunks (takes a chunk and returns boolean)
-            
-        Returns:
-            List of (DocumentChunk, score) tuples
-        """
-        if not self.chunk_embeddings:
-            return []
-        
-        # Get query embedding
-        if self.embedding_method == "sentence_transformers":
-            query_embedding = self.sentence_model.encode(query)
-            
-            # Perform search
-            if self.use_faiss and self.index is not None:
-                # Normalize query vector
-                query_embedding_np = np.array([query_embedding], dtype=np.float32)
-                faiss.normalize_L2(query_embedding_np)
-                
-                # Search in FAISS index
-                scores, indices = self.index.search(query_embedding_np, k*2)  # Get more results to allow for filtering
-                
-                # Get chunks from results
-                results = []
-                for score, idx in zip(scores[0], indices[0]):
-                    if idx < len(self.chunk_ids):
-                        chunk_id = self.chunk_ids[idx]
-                        chunk = self.chunks[chunk_id]
-                        
-                        # Apply filter if provided
-                        if filter_func is None or filter_func(chunk):
-                            results.append((chunk, float(score)))
-                
-                # Limit to k results after filtering
-                return results[:k]
-            else:
-                # Compute similarities manually
-                results = []
-                for chunk_id, embedding in self.chunk_embeddings.items():
-                    chunk = self.chunks[chunk_id]
-                    
-                    # Apply filter if provided
-                    if filter_func is not None and not filter_func(chunk):
-                        continue
-                    
-                    # Compute cosine similarity
-                    similarity = np.dot(query_embedding, embedding) / (np.linalg.norm(query_embedding) * np.linalg.norm(embedding))
-                    results.append((chunk, float(similarity)))
-                
-                # Sort by similarity (descending) and return top k
-                results.sort(key=lambda x: x[1], reverse=True)
-                return results[:k]
-        else:
-            # TFIDF-based search
-            query_embedding = self.vectorizer.transform([query])[0]
-            
-            results = []
-            for chunk_id, embedding in self.chunk_embeddings.items():
-                chunk = self.chunks[chunk_id]
-                
-                # Apply filter if provided
-                if filter_func is not None and not filter_func(chunk):
-                    continue
-                
-                # Compute cosine similarity
-                similarity = cosine_similarity(query_embedding, embedding)[0][0]
-                results.append((chunk, float(similarity)))
-            
-            # Sort by similarity (descending) and return top k
-            results.sort(key=lambda x: x[1], reverse=True)
-            return results[:k]
-    
-    def save(self, file_path: str):
-        """Save the vector store to disk."""
-        # Create data structure to save
-        data = {
-            "embedding_method": self.embedding_method,
-            "embedding_dim": self.embedding_dim,
-            "documents": {doc_id: doc.to_dict() for doc_id, doc in self.documents.items()},
-            "chunk_ids": self.chunk_ids
-        }
-        
-        # Save data
-        with open(file_path, 'wb') as f:
-            pickle.dump(data, f)
-            
-        # Save embeddings separately if using TFIDF (sparse matrices)
-        if self.embedding_method == "tfidf":
-            with open(f"{file_path}.tfidf", 'wb') as f:
-                pickle.dump({
-                    "vectorizer": self.vectorizer,
-                    "tfidf_matrix": self.tfidf_matrix,
-                    "tfidf_features": self.tfidf_features
-                }, f)
-    
-    @classmethod
-    def load(cls, file_path: str):
-        """Load a vector store from disk."""
-        with open(file_path, 'rb') as f:
-            data = pickle.load(f)
-        
-        # Create new vector store
-        vector_store = cls(embedding_dim=data["embedding_dim"])
-        vector_store.embedding_method = data["embedding_method"]
-        vector_store.chunk_ids = data["chunk_ids"]
-        
-        # Reconstruct documents and chunks
-        documents = {}
-        chunks = {}
-        for doc_id, doc_dict in data["documents"].items():
-            doc = Document.from_dict(doc_dict)
-            documents[doc_id] = doc
-            for chunk in doc.chunks:
-                chunks[chunk.id] = chunk
-        
-        vector_store.documents = documents
-        vector_store.chunks = chunks
-        
-        # Load embeddings for TFIDF method
-        if vector_store.embedding_method == "tfidf":
-            with open(f"{file_path}.tfidf", 'rb') as f:
-                tfidf_data = pickle.load(f)
-            
-            vector_store.vectorizer = tfidf_data["vectorizer"]
-            vector_store.tfidf_matrix = tfidf_data["tfidf_matrix"]
-            vector_store.tfidf_features = tfidf_data["tfidf_features"]
-            
-            # Reconstruct chunk embeddings
-            for i, chunk_id in enumerate(vector_store.chunk_ids):
-                if i < vector_store.tfidf_matrix.shape[0]:
-                    vector_store.chunk_embeddings[chunk_id] = vector_store.tfidf_matrix[i]
-        
-class HybridSearcher:
-    """
-    Implements hybrid search combining BM25 and semantic search for more effective retrieval.
-    This combines the strengths of lexical and semantic search methods.
-    """
-    
-    def __init__(self, vector_store=None):
-        """
-        Initialize the hybrid searcher.
-        
-        Args:
-            vector_store: Optional VectorStore instance for semantic search
-        """
-        self.vector_store = vector_store
+        # BM25 for lexical search
         self.bm25 = None
-        self.corpus = []  # Text of each chunk
-        self.chunk_map = {}  # Maps corpus index to chunk ID
-        self.tokenized_corpus = []
-        self.initialized = False
+        self.tokenized_corpus = None
+        
+        # Vector search indexes
+        self.embeddings = None
+        self.faiss_index = None
+        
+        logger.info(f"Initialized SemanticIndexer with sentence_transformers={self.use_sentence_transformers}, faiss={self.use_faiss}")
     
-    def initialize(self, chunks: List[DocumentChunk]):
-        """
-        Initialize the BM25 index with document chunks.
+    def index_documents(self, documents):
+        """Build indexes for all chunks in the provided documents."""
+        logger.info(f"Indexing {len(documents)} documents")
         
-        Args:
-            chunks: List of DocumentChunk objects
-        """
-        self.corpus = [chunk.text for chunk in chunks]
-        self.chunk_map = {i: chunk.id for i, chunk in enumerate(chunks)}
-        
-        # Tokenize corpus for BM25
-        self.tokenized_corpus = [text.lower().split() for text in self.corpus]
-        
-        # Initialize BM25
-        self.bm25 = BM25Okapi(self.tokenized_corpus)
-        self.initialized = True
-    
-    def search(self, query: str, k: int = 5, semantic_weight: float = 0.5, filter_func=None) -> List[Tuple[DocumentChunk, float]]:
-        """
-        Perform hybrid search combining BM25 and semantic search.
-        
-        Args:
-            query: Query text
-            k: Number of results to return
-            semantic_weight: Weight to give semantic search results (0-1)
-            filter_func: Optional function to filter chunks
-            
-        Returns:
-            List of (DocumentChunk, score) tuples
-        """
-        if not self.initialized or not self.bm25:
-            logger.warning("HybridSearcher not initialized. Call initialize() first.")
-            return []
-        
-        lexical_weight = 1.0 - semantic_weight
-        
-        # Normalize weights
-        total_weight = lexical_weight + semantic_weight
-        if total_weight > 0:
-            lexical_weight = lexical_weight / total_weight
-            semantic_weight = semantic_weight / total_weight
-        else:
-            lexical_weight = 0.5
-            semantic_weight = 0.5
-        
-        # Get results from BM25
-        tokenized_query = query.lower().split()
-        bm25_scores = self.bm25.get_scores(tokenized_query)
-        
-        # Normalize BM25 scores to 0-1 range
-        max_bm25_score = max(bm25_scores) if bm25_scores.size > 0 else 1.0
-        if max_bm25_score > 0:
-            bm25_scores = bm25_scores / max_bm25_score
-        
-        # Get results from semantic search if available
-        semantic_scores = {}
-        if self.vector_store and semantic_weight > 0:
-            semantic_results = self.vector_store.similarity_search(query, k=k*2, filter_func=filter_func)
-            for chunk, score in semantic_results:
-                semantic_scores[chunk.id] = score
-        
-        # Combine results
-        combined_scores = {}
-        
-        # Add BM25 scores
-        for i, score in enumerate(bm25_scores):
-            chunk_id = self.chunk_map[i]
-            chunk = self.vector_store.chunks[chunk_id] if self.vector_store else None
-            
-            # Skip if filtered out
-            if filter_func and chunk and not filter_func(chunk):
+        # Collect all chunks
+        all_chunks = []
+        for doc_id, doc in documents.items():
+            if not doc.chunks:
+                logger.warning(f"Document {doc_id} has no chunks, skipping")
                 continue
                 
-            combined_scores[chunk_id] = score * lexical_weight
+            chunk_indices = []
+            for chunk in doc.chunks:
+                chunk_idx = len(all_chunks)
+                all_chunks.append(chunk)
+                chunk_indices.append(chunk_idx)
+                self.chunk_id_to_index[chunk.id] = chunk_idx
+                
+            self.doc_id_to_chunks[doc_id] = chunk_indices
         
-        # Add semantic scores
-        for chunk_id, score in semantic_scores.items():
-            if chunk_id in combined_scores:
-                combined_scores[chunk_id] += score * semantic_weight
+        self.chunks = all_chunks
+        
+        if not all_chunks:
+            logger.warning("No chunks to index!")
+            return
+            
+        logger.info(f"Found {len(all_chunks)} chunks to index")
+        
+        # Create text corpus for indexing
+        corpus = [chunk.text for chunk in all_chunks]
+        
+        # Create BM25 index
+        self.tokenized_corpus = [self._tokenize(text) for text in corpus]
+        self.bm25 = BM25Okapi(self.tokenized_corpus)
+        
+        # Create TF-IDF index
+        self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(corpus)
+        
+        # Create vector embeddings
+        if self.use_sentence_transformers:
+            embeddings = self._create_embeddings_with_transformers(corpus)
+        else:
+            embeddings = self.tfidf_matrix
+            
+        # Store embeddings in chunks
+        for i, chunk in enumerate(all_chunks):
+            if self.use_sentence_transformers:
+                chunk.embedding = embeddings[i]
             else:
-                combined_scores[chunk_id] = score * semantic_weight
+                # For TF-IDF, just store the index (can't easily store sparse matrices in objects)
+                chunk.embedding = i
         
-        # Sort by combined score
-        sorted_chunk_ids = sorted(combined_scores.keys(), key=lambda cid: combined_scores[cid], reverse=True)
+        # Create FAISS index if enabled
+        if self.use_faiss and self.use_sentence_transformers:
+            embedding_dim = embeddings.shape[1]
+            self.faiss_index = faiss.IndexFlatIP(embedding_dim)  # Inner product (cosine on normalized vectors)
+            self.faiss_index.add(embeddings)
+            self.embeddings = embeddings
+            logger.info(f"Created FAISS index with {len(embeddings)} vectors of dimension {embedding_dim}")
+        elif self.use_sentence_transformers:
+            # Store embeddings directly if FAISS not used
+            self.embeddings = embeddings
+            logger.info(f"Stored {len(embeddings)} embedding vectors of dimension {embeddings.shape[1]}")
         
-        # Construct result list
-        results = []
-        for chunk_id in sorted_chunk_ids[:k]:
-            chunk = self.vector_store.chunks[chunk_id] if self.vector_store else None
-            if chunk:
-                results.append((chunk, combined_scores[chunk_id]))
+        logger.info("Indexing completed successfully")
+    
+    def _create_embeddings_with_transformers(self, texts):
+        """Create embeddings using sentence transformers."""
+        logger.info(f"Creating embeddings for {len(texts)} texts using SentenceTransformer")
+        
+        # Process in batches to avoid memory issues with large corpora
+        batch_size = 32
+        num_texts = len(texts)
+        embeddings_list = []
+        
+        for i in tqdm(range(0, num_texts, batch_size), desc="Creating embeddings"):
+            batch_texts = texts[i:min(i+batch_size, num_texts)]
+            batch_embeddings = self.sentence_model.encode(batch_texts)
+            embeddings_list.append(batch_embeddings)
+        
+        # Combine all batches
+        embeddings = np.vstack(embeddings_list)
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
+        return embeddings
+    
+    def _tokenize(self, text):
+        """Tokenize text for BM25 search."""
+        return [word.lower() for word in word_tokenize(text) if word.lower() not in STOPWORDS]
+    
+    def hybrid_search(self, query, top_k=10, alpha=0.5):
+        """
+        Perform hybrid search combining lexical and semantic search.
+        
+        Args:
+            query: The search query
+            top_k: Number of results to return
+            alpha: Weight for semantic search (1-alpha = weight for lexical search)
+            
+        Returns:
+            List of (chunk, score) tuples
+        """
+        if not self.chunks:
+            logger.warning("No indexed chunks available for search!")
+            return []
+        
+        # Get results from both methods
+        semantic_results = self.semantic_search(query, top_k * 2)
+        lexical_results = self.lexical_search(query, top_k * 2)
+        
+        # Combine and normalize scores
+        combined_scores = {}
+        
+        # Get max scores for normalization
+        max_semantic = max([score for _, score in semantic_results]) if semantic_results else 1.0
+        max_lexical = max([score for _, score in lexical_results]) if lexical_results else 1.0
+        
+        # Normalize and combine semantic results
+        for chunk, score in semantic_results:
+            combined_scores[chunk.id] = alpha * (score / max_semantic)
+        
+        # Normalize and combine lexical results
+        for chunk, score in lexical_results:
+            if chunk.id in combined_scores:
+                combined_scores[chunk.id] += (1 - alpha) * (score / max_lexical)
+            else:
+                combined_scores[chunk.id] = (1 - alpha) * (score / max_lexical)
+        
+        # Get chunks by ID
+        id_to_chunk = {chunk.id: chunk for chunk in self.chunks}
+        
+        # Sort and return top_k results
+        results = sorted([(id_to_chunk[chunk_id], score) 
+                         for chunk_id, score in combined_scores.items()], 
+                        key=lambda x: x[1], reverse=True)
+        
+        return results[:top_k]
+    
+    def semantic_search(self, query, top_k=10):
+        """
+        Perform semantic search using embeddings.
+        
+        Args:
+            query: The search query
+            top_k: Number of results to return
+            
+        Returns:
+            List of (chunk, score) tuples
+        """
+        if not self.chunks:
+            return []
+        
+        if self.use_sentence_transformers:
+            # Encode the query
+            query_embedding = self.sentence_model.encode(query)
+            query_embedding = query_embedding / np.linalg.norm(query_embedding)  # Normalize
+            
+            if self.use_faiss:
+                # Search using FAISS
+                scores, indices = self.faiss_index.search(query_embedding.reshape(1, -1), top_k)
+                results = [(self.chunks[idx], float(score)) for score, idx in zip(scores[0], indices[0])]
+            else:
+                # Compute cosine similarity manually
+                similarities = np.dot(self.embeddings, query_embedding)
+                top_indices = np.argsort(similarities)[-top_k:][::-1]
+                results = [(self.chunks[idx], float(similarities[idx])) for idx in top_indices]
+        else:
+            # Fallback to TF-IDF
+            query_vec = self.tfidf_vectorizer.transform([query])
+            similarities = cosine_similarity(query_vec, self.tfidf_matrix)[0]
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            results = [(self.chunks[idx], float(similarities[idx])) for idx in top_indices]
+        
+        return results
+    
+    def lexical_search(self, query, top_k=10):
+        """
+        Perform lexical search using BM25.
+        
+        Args:
+            query: The search query
+            top_k: Number of results to return
+            
+        Returns:
+            List of (chunk, score) tuples
+        """
+        if not self.chunks:
+            return []
+        
+        # Tokenize query and get BM25 scores
+        tokenized_query = self._tokenize(query)
+        bm25_scores = self.bm25.get_scores(tokenized_query)
+        
+        # Get top results
+        top_indices = np.argsort(bm25_scores)[-top_k:][::-1]
+        results = [(self.chunks[idx], float(bm25_scores[idx])) for idx in top_indices if bm25_scores[idx] > 0]
         
         return results
 
 
 class QueryProcessor:
     """
-    Handles query analysis, refinement, and expansion for more effective retrieval.
+    Analyzes user queries, expands them, and reformulates them to improve retrieval performance.
     """
     
     def __init__(self):
         """Initialize the query processor."""
-        self.synonyms_enabled = True
-        self.query_expansion_enabled = True
-        self.history = []  # List of past queries and their refined versions
+        # Initialize NLP resources
+        self.nlp = nlp
+        self.use_wordnet = True
     
-    def process_query(self, query: str, query_context: Dict = None) -> Dict[str, Any]:
+    def process_query(self, query):
         """
-        Analyze and refine a user query.
+        Process a query to improve retrieval performance.
         
         Args:
-            query: The original user query
-            query_context: Optional context information (e.g., conversation history)
+            query: Original user query
             
         Returns:
-            Dictionary with refined query and query analysis
+            Dict containing original query, expanded query, query analysis, etc.
         """
-        # Basic preprocessing
-        clean_query = self._preprocess_query(query)
+        # Parse the query
+        query_doc = self.nlp(query)
         
-        # Analyze query
-        analysis = self._analyze_query(clean_query)
+        # Extract query intent and key concepts
+        intent_analysis = self._analyze_intent(query_doc)
         
-        # Refine query based on analysis
-        refined_query = self._refine_query(clean_query, analysis, query_context)
-        
-        # Expand query with synonyms if enabled
-        expanded_query = self._expand_query(refined_query) if self.query_expansion_enabled else refined_query
-        
-        # Add to history
-        self.history.append({
-            "original": query,
-            "cleaned": clean_query,
-            "refined": refined_query,
-            "expanded": expanded_query,
-            "analysis": analysis
-        })
+        # Perform query expansion
+        expanded_query = self._expand_query(query, query_doc)
         
         return {
             "original_query": query,
-            "refined_query": refined_query,
             "expanded_query": expanded_query,
-            "analysis": analysis
+            "intent": intent_analysis["intent"],
+            "keywords": intent_analysis["keywords"],
+            "entities": intent_analysis["entities"],
+            "expected_answer_type": intent_analysis["expected_answer_type"]
         }
     
-    def _preprocess_query(self, query: str) -> str:
-        """Clean and normalize the query."""
-        # Remove extra whitespace
-        query = re.sub(r'\s+', ' ', query).strip()
-        
-        # Remove special characters that might interfere with search
-        query = re.sub(r'[^\w\s?!.,-]', '', query)
-        
-        return query
-    
-    def _analyze_query(self, query: str) -> Dict[str, Any]:
+    def _analyze_intent(self, query_doc):
         """
-        Analyze the query to determine its type, structure, and key terms.
+        Analyze the intent behind a query.
         
+        Args:
+            query_doc: spaCy Doc object of the query
+            
         Returns:
-            Dictionary containing query analysis
+            Dict with query intent analysis
         """
-        analysis = {
-            "query_type": None,
-            "key_terms": [],
+        # Default values
+        result = {
+            "intent": "general_query",
+            "keywords": [],
             "entities": [],
-            "question_type": None,
-            "focus": None
+            "expected_answer_type": "factoid"
         }
         
-        # Parse with spaCy
-        doc = nlp(query)
+        # Extract keywords (important nouns, verbs, and adjectives)
+        for token in query_doc:
+            if token.pos_ in ('NOUN', 'PROPN') and not token.is_stop:
+                result["keywords"].append({"text": token.text, "lemma": token.lemma_, "pos": token.pos_})
+            elif token.pos_ in ('VERB', 'ADJ') and token.is_alpha and len(token.text) > 2 and not token.is_stop:
+                result["keywords"].append({"text": token.text, "lemma": token.lemma_, "pos": token.pos_})
         
-        # Extract key terms
-        key_terms = []
-        for token in doc:
-            if token.pos_ in ('NOUN', 'PROPN', 'VERB') and not token.is_stop:
-                key_terms.append(token.lemma_)
-        
-        analysis["key_terms"] = key_terms
-        
-        # Extract entities
-        entities = []
-        for ent in doc.ents:
-            entities.append({"text": ent.text, "label": ent.label_})
-        
-        analysis["entities"] = entities
-        
-        # Determine query type (question, command, keyword)
-        if query.endswith('?') or query.lower().startswith(('what', 'who', 'where', 'when', 'why', 'how')):
-            analysis["query_type"] = "question"
+        # Extract named entities
+        for ent in query_doc.ents:
+            result["entities"].append({"text": ent.text, "label": ent.label_})
             
-            # Determine question type
-            first_word = doc[0].text.lower() if len(doc) > 0 else ""
-            question_types = {
-                'what': 'definition',
-                'who': 'person',
-                'where': 'location',
-                'when': 'time',
-                'why': 'reason',
-                'how': 'process'
-            }
-            
-            if first_word in question_types:
-                analysis["question_type"] = question_types[first_word]
+        # Determine question type and expected answer type
+        first_token = query_doc[0].text.lower() if len(query_doc) > 0 else ""
         
-        elif doc[0].pos_ == 'VERB' if len(doc) > 0 else False:
-            analysis["query_type"] = "command"
-        else:
-            analysis["query_type"] = "keyword"
+        # Map question words to expected answer types
+        question_type_mapping = {
+            "what": "definition",
+            "who": "person",
+            "when": "time",
+            "where": "location",
+            "why": "reason",
+            "how": "process"
+        }
         
-        # Determine query focus (main subject)
-        for token in doc:
-            if token.dep_ in ('nsubj', 'dobj', 'pobj') and token.pos_ in ('NOUN', 'PROPN'):
-                analysis["focus"] = token.text
-                break
+        if first_token in question_type_mapping:
+            result["intent"] = "question"
+            result["expected_answer_type"] = question_type_mapping[first_token]
+        elif "?" in query_doc.text:
+            result["intent"] = "question"
         
-        return analysis
+        # Check for command/instruction intent
+        if any(token.lemma_ in ("explain", "describe", "define", "list", "show", "find") for token in query_doc):
+            result["intent"] = "instruction"
+        
+        return result
     
-    def _refine_query(self, query: str, analysis: Dict[str, Any], query_context: Dict = None) -> str:
+    def _expand_query(self, query, query_doc):
         """
-        Refine the query based on analysis and context.
+        Expand a query with related terms and synonyms to improve recall.
         
         Args:
-            query: The preprocessed query
-            analysis: The query analysis dictionary
-            query_context: Optional context information
-            
-        Returns:
-            Refined query string
-        """
-        refined_query = query
-        
-        # Don't refine if it's just a simple keyword query
-        if analysis["query_type"] == "keyword" and len(query.split()) <= 3:
-            return query
-        
-        # Add focus for certain question types that might be implicit
-        if analysis["query_type"] == "question" and analysis["question_type"] == "definition" and not analysis["focus"]:
-            # Look for noun after "what is" pattern
-            match = re.search(r'what\s+is\s+(?:a|an|the)?\s*([a-z0-9_\- ]+)', query.lower())
-            if match:
-                focus_term = match.group(1).strip()
-                if focus_term and not focus_term in refined_query:
-                    refined_query = f"{refined_query} about {focus_term}"
-        
-        # Incorporate context if available
-        if query_context and 'conversation_history' in query_context:
-            history = query_context['conversation_history']
-            
-            # If query is very short and looks like a follow-up
-            if len(query.split()) <= 5 and not analysis["focus"] and history:
-                last_query = history[-1].get('query', '')
-                last_query_analysis = self._analyze_query(last_query)
-                
-                # Check if this might be a follow-up question
-                follow_up_indicators = ['they', 'them', 'it', 'this', 'that', 'these', 'those', 'their', 'its']
-                if any(word in query.lower().split() for word in follow_up_indicators):
-                    # Add topic from previous query for context
-                    if last_query_analysis.get("focus"):
-                        refined_query = f"{refined_query} about {last_query_analysis['focus']}"
-        
-        return refined_query
-    
-    def _expand_query(self, query: str) -> str:
-        """
-        Expand the query with synonyms and related terms.
-        
-        Args:
-            query: The refined query
+            query: Original query string
+            query_doc: spaCy Doc object of the query
             
         Returns:
             Expanded query string
         """
-        # Parse query
-        doc = nlp(query)
+        # Extract key terms for expansion
+        key_terms = []
+        for token in query_doc:
+            if token.pos_ in ('NOUN', 'VERB', 'ADJ') and not token.is_stop:
+                key_terms.append(token.lemma_)
         
-        # Extract content words
-        content_words = [token.text for token in doc 
-                       if token.pos_ in ('NOUN', 'VERB', 'ADJ', 'PROPN') 
-                       and not token.is_stop
-                       and len(token.text) > 3]
+        if not key_terms:
+            return query  # Nothing to expand
         
-        # Limit to 3 most important terms to avoid query drift
-        if len(content_words) > 3:
-            # Prioritize nouns and named entities
-            nouns_and_entities = [token.text for token in doc 
-                                if token.pos_ in ('NOUN', 'PROPN') 
-                                and not token.is_stop]
-            if len(nouns_and_entities) >= 3:
-                content_words = nouns_and_entities[:3]
-            else:
-                content_words = content_words[:3]
+        # Get synonyms using WordNet if available
+        expansion_terms = set()
         
-        # Get synonyms for each word
-        expanded_terms = set()
-        for word in content_words:
-            synonyms = self._get_synonyms(word)
-            # Add top 2 synonyms at most
-            expanded_terms.update(synonyms[:2])
+        if self.use_wordnet:
+            for term in key_terms:
+                # Get WordNet synonyms
+                synsets = wordnet.synsets(term)[:2]  # Limit to top 2 synsets to avoid too much expansion
+                for synset in synsets:
+                    lemmas = synset.lemmas()[:3]  # Limit to top 3 synonyms per synset
+                    for lemma in lemmas:
+                        synonym = lemma.name().replace('_', ' ')
+                        if synonym != term and synonym not in query.lower() and len(synonym) > 3:
+                            expansion_terms.add(synonym)
         
-        # Remove any terms already in the query
-        query_words = query.lower().split()
-        expanded_terms = [term for term in expanded_terms 
-                        if term.lower() not in query_words 
-                        and all(term.lower() not in qw for qw in query_words)]
+        # Add hyponyms and hypernyms for nouns
+        noun_terms = [term for term, token in zip(key_terms, query_doc) if token.pos_ in ('NOUN', 'PROPN')]
+        for term in noun_terms:
+            synsets = wordnet.synsets(term, pos=wordnet.NOUN)[:1]  # Limit to top synset
+            for synset in synsets:
+                # Add hypernyms (more general terms)
+                for hypernym in synset.hypernyms()[:1]:
+                    lemmas = hypernym.lemmas()[:1]
+                    for lemma in lemmas:
+                        hypernym_term = lemma.name().replace('_', ' ')
+                        if hypernym_term not in query.lower() and len(hypernym_term) > 3:
+                            expansion_terms.add(hypernym_term)
+                
+                # Add hyponyms (more specific terms)
+                for hyponym in synset.hyponyms()[:2]:
+                    lemmas = hyponym.lemmas()[:1]
+                    for lemma in lemmas:
+                        hyponym_term = lemma.name().replace('_', ' ')
+                        if hyponym_term not in query.lower() and len(hyponym_term) > 3:
+                            expansion_terms.add(hyponym_term)
         
-        # Add expanded terms to query
-        if expanded_terms:
-            expanded_query = f"{query} {' '.join(expanded_terms)}"
+        # Limit the number of expansion terms to avoid query dilution
+        expansion_terms = list(expansion_terms)[:5]
+        
+        if expansion_terms:
+            expanded_query = query + " " + " ".join(expansion_terms)
             return expanded_query
-            
-        return query
-    
-    def _get_synonyms(self, word: str) -> List[str]:
-        """
-        Get synonyms for a word using WordNet.
-        
-        Args:
-            word: The word to find synonyms for
-            
-        Returns:
-            List of synonym strings
-        """
-        synonyms = set()
-        
-        # Get synonyms from WordNet
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                synonym = lemma.name().replace('_', ' ')
-                if synonym != word and len(synonym) > 3:
-                    synonyms.add(synonym)
-        
-        # Limit to 5 synonyms
-        return list(synonyms)[:5]
+        else:
+            return query
 
 
-class ImprovedSummaryGenerator:
+class AbstractiveSummarizer:
     """
-    Generates high-quality, coherent summaries using advanced NLP techniques.
-    Supports both extractive and abstractive summarization methods.
+    Generates coherent, abstractive summaries from retrieved document chunks.
     """
     
     def __init__(self):
-        """Initialize the summary generator."""
-        self.language = "english"
-        self.stop_words = STOPWORDS
+        """Initialize the summarizer with appropriate models."""
+        self.use_transformers = transformers_summarization_available
         
-        # Initialize extractive summarization components
-        if sumy_available:
-            self.stemmer = Stemmer(self.language)
-            self.sumy_stop_words = get_stop_words(self.language)
+        if not self.use_transformers:
+            # Fallback to extractive summarization
+            self.language = "english"
+            self.stemmer = Stemmer(self.language) if sumy_available else None
             
-            # Initialize extractive summarizers
-            self.lexrank = LexRankSummarizer(self.stemmer)
-            self.lexrank.stop_words = self.sumy_stop_words
-            
-            self.lsa = LsaSummarizer(self.stemmer)
-            self.lsa.stop_words = self.sumy_stop_words
-        
-        # Check if transformers-based summarization is available
-        self.abstractive_enabled = transformers_summarization_available
+            if sumy_available:
+                self.sumy_stop_words = get_stop_words(self.language)
+                self.lexrank = LexRankSummarizer(self.stemmer)
+                self.lexrank.stop_words = self.sumy_stop_words
+                self.lsa = LsaSummarizer(self.stemmer)
+                self.lsa.stop_words = self.sumy_stop_words
     
-    def generate_summary(self, texts: List[str], query: str, max_length: int = 500, use_abstractive: bool = None) -> str:
+    def generate_summary(self, chunks, query_info, max_length=500):
         """
-        Generate a comprehensive, coherent summary from multiple texts based on the query.
+        Generate a coherent summary from document chunks that addresses the query.
         
         Args:
-            texts: List of document texts to summarize
-            query: The user's query
-            max_length: Target maximum length of summary in words
-            use_abstractive: Whether to use abstractive summarization (if available)
-                             If None, will automatically decide based on content
+            chunks: List of (DocumentChunk, score) tuples, ordered by relevance
+            query_info: Query analysis information from QueryProcessor
+            max_length: Maximum summary length (words for extractive, tokens for abstractive)
             
         Returns:
-            A coherent summary of the key information relevant to the query
+            Generated summary string
         """
-        if not texts:
+        if not chunks:
             return "No relevant information found."
-            
-        try:
-            # Process and clean the texts
-            processed_texts = self._preprocess_texts(texts)
-            if not processed_texts:
-                return "No relevant information found after processing."
-                
-            # Extract query intent and key concepts
-            query_concepts = self._extract_key_concepts(query)
-            
-            # Determine if we should use abstractive summarization
-            if use_abstractive is None:
-                # Use abstractive for shorter, more focused content
-                total_length = sum(len(text.split()) for text in processed_texts)
-                use_abstractive = self.abstractive_enabled and total_length < 3000
-            
-            # Generate summary using appropriate method
-            if use_abstractive and self.abstractive_enabled:
-                summary = self._generate_abstractive_summary(processed_texts, query, query_concepts, max_length)
+        
+        # Extract text from chunks, ordered by relevance
+        chunk_texts = [chunk.text for chunk, _ in chunks]
+        combined_text = "\n\n".join(chunk_texts)
+        
+        # Use abstractive summarization if available
+        if self.use_transformers:
+            return self._generate_abstractive_summary(chunk_texts, query_info, max_length)
+        else:
+            # Fall back to extractive summarization
+            return self._generate_extractive_summary(combined_text, query_info, max_length)
+    
+    def _generate_abstractive_summary(self, texts, query_info, max_tokens=500):
+        """Generate an abstractive summary using a transformer model."""
+        # Prepare the context with the most relevant chunks
+        # Limit total length to avoid exceeding model's max length
+        MAX_CONTEXT_LENGTH = 4000  # Conservative limit for most models
+        
+        context = ""
+        for text in texts:
+            if len(context.split()) + len(text.split()) <= MAX_CONTEXT_LENGTH:
+                context += text + "\n\n"
             else:
-                summary = self._generate_extractive_summary(processed_texts, query, query_concepts, max_length)
+                break
+        
+        # Create a prompt that instructs the model what kind of summary to generate
+        query = query_info["original_query"]
+        intent = query_info["intent"]
+        
+        if intent == "question":
+            prompt = f"Please answer this question based on the provided information: {query}\n\nInformation:\n{context}\n\nAnswer:"
+        else:
+            prompt = f"Please provide a comprehensive summary of the following information in response to this query: {query}\n\nInformation:\n{context}\n\nSummary:"
+        
+        try:
+            # Generate summary using BART model
+            summary = summarizer(prompt, max_length=max_tokens, min_length=50, do_sample=False)[0]['summary_text']
+            
+            # Clean up the summary
+            summary = summary.strip()
             
             return summary
             
         except Exception as e:
-            logger.error(f"Error generating summary: {str(e)}")
-            # Fall back to basic extractive summarization
-            return self._generate_basic_summary(texts, query)
-    
-    def _preprocess_texts(self, texts: List[str]) -> List[str]:
-        """Clean and normalize the input texts."""
-        processed_texts = []
-        for text in texts:
-            if not text or not text.strip():
-                continue
-                
-            # Normalize whitespace
-            text = re.sub(r'\s+', ' ', text)
-            
-            # Remove excessive punctuation
-            text = re.sub(r'([.!?])\1+', r'\1', text)
-            
-            # Remove content in brackets if it looks like citations or references
-            text = re.sub(r'\[\d+\]', '', text)
-            
-            processed_texts.append(text.strip())
-            
-        return processed_texts
-    
-    def _extract_key_concepts(self, query: str) -> Dict[str, Any]:
-        """Extract key concepts and intent from the query."""
-        doc = nlp(query)
-        
-        concepts = {
-            'keywords': [],
-            'entities': [],
-            'root_verb': None,
-            'question_type': None,
-            'original_query': query
-        }
-        
-        # Extract keywords (important nouns and adjectives)
-        for token in doc:
-            if token.pos_ in ('NOUN', 'PROPN') and not token.is_stop:
-                concepts['keywords'].append(token.lemma_)
-            elif token.pos_ == 'ADJ' and token.is_alpha and len(token.text) > 2:
-                concepts['keywords'].append(token.lemma_)
-        
-        # Extract named entities
-        for ent in doc.ents:
-            concepts['entities'].append((ent.text, ent.label_))
-            
-        # Determine the main verb (often indicates the action requested)
-        for token in doc:
-            if token.dep_ == 'ROOT' and token.pos_ == 'VERB':
-                concepts['root_verb'] = token.lemma_
-                
-        # Determine question type if it's a question
-        question_words = {'what': 'definition', 'how': 'process', 'why': 'reason', 
-                         'when': 'time', 'where': 'location', 'who': 'person'}
-        
-        if len(doc) > 0:
-            first_word = doc[0].text.lower()
-            if first_word in question_words:
-                concepts['question_type'] = question_words[first_word]
-            elif '?' in query:
-                concepts['question_type'] = 'general'
-            
-        return concepts
-    
-    def _generate_extractive_summary(self, texts: List[str], query: str, query_concepts: Dict[str, Any], max_length: int) -> str:
-        """
-        Generate a summary using extractive methods, which select and organize the most relevant sentences.
-        
-        Args:
-            texts: List of preprocessed document texts
-            query: The user's query
-            query_concepts: Dictionary with query analysis
-            max_length: Target maximum length in words
-            
-        Returns:
-            Extractive summary text
-        """
-        # Combine texts into a single document
-        combined_text = "\n\n".join(texts)
-        
-        # Extract information units (sentences)
-        sentences = nltk.sent_tokenize(combined_text)
-        
-        # Score sentences by relevance to query
-        scored_sentences = self._score_sentences_by_relevance(sentences, query, query_concepts)
-        
-        # Remove redundancies
-        unique_sentences = self._remove_redundant_sentences(scored_sentences)
-        
-        # Select top sentences within length limit
-        selected_sentences = self._select_within_length(unique_sentences, max_length)
-        
-        # Organize selected sentences
-        organized_sentences = self._organize_sentences(selected_sentences, query_concepts)
-        
-        # Generate the final summary text
-        summary = self._format_summary(organized_sentences, query, query_concepts)
-        
-        return summary
-    
-    def _score_sentences_by_relevance(self, sentences: List[str], query: str, query_concepts: Dict[str, Any]) -> List[Tuple[str, float]]:
-        """Score sentences by their relevance to the query."""
-        scored_sentences = []
-        
-        # Extract query terms for matching
-        query_terms = set(query_concepts['keywords'])
-        entity_terms = set(entity for entity, _ in query_concepts['entities'])
-        all_query_terms = query_terms.union(entity_terms)
-        
-        for sentence in sentences:
-            if len(sentence.split()) < 5:  # Skip very short sentences
-                continue
-                
-            # Create a spaCy doc for the sentence
-            sentence_doc = nlp(sentence)
-            
-            # Initialize score components
-            term_match_score = 0.0
-            semantic_score = 0.0
-            question_type_score = 0.0
-            position_score = 0.0
-            
-            # Term matching score
-            sentence_terms = set()
-            for token in sentence_doc:
-                if not token.is_stop and token.is_alpha and len(token.text) > 2:
-                    sentence_terms.add(token.lemma_)
-            
-            # Calculate term overlap
-            matching_terms = sentence_terms.intersection(all_query_terms)
-            if all_query_terms:
-                term_match_score = len(matching_terms) / len(all_query_terms)
-            
-            # Adjust score based on question type
-            if query_concepts['question_type']:
-                # Boost sentences that match specific question types
-                if query_concepts['question_type'] == 'definition':
-                    pattern = r'\b(is|are|refers to|defined as|means)\b'
-                    if re.search(pattern, sentence.lower()):
-                        question_type_score = 0.3
-                        
-                elif query_concepts['question_type'] == 'process':
-                    process_words = ['step', 'process', 'procedure', 'method', 'approach']
-                    if any(word in sentence.lower() for word in process_words):
-                        question_type_score = 0.2
-                        
-                elif query_concepts['question_type'] == 'reason':
-                    reason_words = ['because', 'since', 'therefore', 'due to', 'result']
-                    if any(word in sentence.lower() for word in reason_words):
-                        question_type_score = 0.2
-            
-            # Calculate final score
-            final_score = 0.5 * term_match_score + 0.3 * semantic_score + 0.2 * question_type_score
-            
-            # Only include sentences with some relevance
-            if final_score > 0.1:
-                scored_sentences.append((sentence, final_score))
-        
-        # Sort by score (descending)
-        scored_sentences.sort(key=lambda x: x[1], reverse=True)
-        
-        return scored_sentences
-    
-    def _remove_redundant_sentences(self, scored_sentences: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
-        """Remove redundant sentences to avoid repetition."""
-        if not scored_sentences:
-            return []
-            
-        # Sort sentences by score (already done, but just to be sure)
-        sorted_sentences = sorted(scored_sentences, key=lambda x: x[1], reverse=True)
-        
-        # Extract just the sentences for processing
-        sentences = [sent for sent, _ in sorted_sentences]
-        
-        # Calculate similarity matrix
-        similarity_matrix = np.zeros((len(sentences), len(sentences)))
-        
-        for i in range(len(sentences)):
-            doc_i = nlp(sentences[i])
-            
-            for j in range(i+1, len(sentences)):
-                doc_j = nlp(sentences[j])
-                
-                # Calculate similarity
-                try:
-                    # Use spaCy's similarity if vectors are available
-                    if has_vectors:
-                        similarity = doc_i.similarity(doc_j)
-                    else:
-                        # Fallback to word overlap
-                        words_i = set(token.text.lower() for token in doc_i 
-                                    if token.is_alpha and not token.is_stop)
-                        words_j = set(token.text.lower() for token in doc_j 
-                                    if token.is_alpha and not token.is_stop)
-                        
-                        if words_i and words_j:
-                            similarity = len(words_i.intersection(words_j)) / len(words_i.union(words_j))
-                        else:
-                            similarity = 0.0
-                    
-                    similarity_matrix[i, j] = similarity
-                    similarity_matrix[j, i] = similarity
-                except:
-                    # If similarity calculation fails, assume low similarity
-                    similarity_matrix[i, j] = 0.1
-                    similarity_matrix[j, i] = 0.1
-        
-        # Initialize list to keep track of which sentences to include
-        include_mask = np.ones(len(sentences), dtype=bool)
-        
-        # Iterate through sentences in order of score
-        for i in range(len(sentences)):
-            if not include_mask[i]:
-                continue  # Skip already excluded sentences
-                
-            # Check similarity with all higher-scoring sentences
-            for j in range(i+1, len(sentences)):
-                if not include_mask[j]:
-                    continue  # Skip already excluded sentences
-                    
-                # If very similar, exclude the lower-scoring sentence
-                if similarity_matrix[i, j] > 0.6:  # Threshold for similarity
-                    include_mask[j] = False
-        
-        # Create filtered list of non-redundant sentences with their scores
-        unique_sentences = [(sentences[i], sorted_sentences[i][1]) 
-                          for i in range(len(sentences)) 
-                          if include_mask[i]]
-        
-        return unique_sentences
-    
-    def _select_within_length(self, scored_sentences: List[Tuple[str, float]], max_length: int) -> List[Tuple[str, float]]:
-        """Select top sentences that fit within the target length."""
-        if not scored_sentences:
-            return []
-            
-        current_length = 0
-        selected_sentences = []
-        
-        for sentence, score in scored_sentences:
-            sentence_length = len(sentence.split())
-            if current_length + sentence_length <= max_length:
-                selected_sentences.append((sentence, score))
-                current_length += sentence_length
-            
-            if current_length >= max_length:
-                break
-                
-        return selected_sentences
-    
-    def _organize_sentences(self, scored_sentences: List[Tuple[str, float]], query_concepts: Dict[str, Any]) -> List[str]:
-        """
-        Organize selected sentences into a coherent structure based on query type.
-        
-        Returns:
-            List of organized sentences
-        """
-        if not scored_sentences:
-            return []
-            
-        # Extract just the sentences (discard scores)
-        sentences = [sent for sent, _ in scored_sentences]
-        
-        # For definition queries, organize by definition, elaboration, examples
-        if query_concepts['question_type'] == 'definition':
-            definitions = []
-            elaborations = []
-            examples = []
-            
-            for sentence in sentences:
-                lowercase = sentence.lower()
-                
-                # Check for definition patterns
-                if any(pattern in lowercase for pattern in ['is a', 'refers to', 'defined as', 'means']):
-                    definitions.append(sentence)
-                # Check for examples
-                elif any(word in lowercase for word in ['example', 'instance', 'such as', 'like']):
-                    examples.append(sentence)
-                else:
-                    elaborations.append(sentence)
-            
-            # Combine in logical order
-            organized = definitions + elaborations + examples
-            return organized
-            
-        # For process queries, try to identify sequential steps
-        elif query_concepts['question_type'] == 'process':
-            # Look for sentences with sequential markers
-            step_sentences = []
-            other_sentences = []
-            
-            for sentence in sentences:
-                if re.search(r'\b(first|second|third|next|then|finally|step|phase)\b', sentence.lower()):
-                    step_sentences.append(sentence)
-                else:
-                    other_sentences.append(sentence)
-            
-            # Put step sentences first, then other sentences
-            return step_sentences + other_sentences
-            
-        # For reason queries, organize by claims and reasoning
-        elif query_concepts['question_type'] == 'reason':
-            claims = []
-            reasons = []
-            
-            for sentence in sentences:
-                if any(word in sentence.lower() for word in ['because', 'since', 'due to', 'reason']):
-                    reasons.append(sentence)
-                else:
-                    claims.append(sentence)
-            
-            # Put claims first, then reasons
-            return claims + reasons
-            
-        # Default organization is by relevance (already sorted by score)
-        return sentences
-    
-    def _format_summary(self, sentences: List[str], query: str, query_concepts: Dict[str, Any]) -> str:
-        """Format the final summary with introduction and conclusion."""
-        if not sentences:
-            return "No relevant information was found to answer this query."
-        
-        # Create introduction
-        introduction = self._create_introduction(query, query_concepts)
-        
-        # Create paragraphs from sentences
-        paragraphs = self._create_paragraphs(sentences)
-        
-        # Create conclusion if appropriate
-        conclusion = self._create_conclusion(query, query_concepts)
-        
-        # Combine all parts
-        summary_parts = [introduction]
-        summary_parts.extend(paragraphs)
-        if conclusion:
-            summary_parts.append(conclusion)
-        
-        return "\n\n".join(summary_parts)
-    
-    def _create_paragraphs(self, sentences: List[str]) -> List[str]:
-        """Group sentences into coherent paragraphs."""
-        if not sentences:
-            return []
-            
-        # If few sentences, return as a single paragraph
-        if len(sentences) <= 3:
-            return [" ".join(sentences)]
-            
-        # Initialize paragraphs
-        paragraphs = []
-        current_paragraph = [sentences[0]]
-        
-        for i in range(1, len(sentences)):
-            current_sentence = sentences[i]
-            previous_sentence = sentences[i-1]
-            
-            # Check if sentences are related
-            # This is a simple heuristic - could be improved with semantic analysis
-            sentence_1_doc = nlp(previous_sentence)
-            sentence_2_doc = nlp(current_sentence)
-            
-            # Get content words from each sentence
-            words_1 = set(token.text.lower() for token in sentence_1_doc 
-                        if token.is_alpha and not token.is_stop)
-            words_2 = set(token.text.lower() for token in sentence_2_doc 
-                        if token.is_alpha and not token.is_stop)
-            
-            # Calculate overlap
-            if words_1 and words_2:
-                overlap = len(words_1.intersection(words_2)) / len(words_1.union(words_2))
-            else:
-                overlap = 0
-            
-            # If sentences are related and paragraph not too long, add to current paragraph
-            if overlap > 0.2 and len(current_paragraph) < 5:
-                current_paragraph.append(current_sentence)
-            else:
-                # Start a new paragraph
-                paragraphs.append(" ".join(current_paragraph))
-                current_paragraph = [current_sentence]
-        
-        # Add the last paragraph
-        if current_paragraph:
-            paragraphs.append(" ".join(current_paragraph))
-        
-        return paragraphs
-    
-    def _create_introduction(self, query: str, query_concepts: Dict[str, Any]) -> str:
-        """Create an introductory sentence based on the query."""
-        # Extract query focus (main subject)
-        focus = None
-        for entity, _ in query_concepts['entities']:
-            focus = entity
-            break
-            
-        if not focus and query_concepts['keywords']:
-            focus = query_concepts['keywords'][0]
-        
-        # Generate introduction
-        if focus:
-            if query_concepts['question_type'] == 'definition':
-                return f"Here is information about what {focus} is:"
-            elif query_concepts['question_type'] == 'process':
-                return f"Here is information about how {focus} works:"
-            elif query_concepts['question_type'] == 'reason':
-                return f"Here is information about why {focus} happens:"
-            else:
-                return f"Here is information about {focus}:"
-        else:
-            return "Here is the relevant information based on your query:"
-    
-    def _create_conclusion(self, query: str, query_concepts: Dict[str, Any]) -> str:
-        """Create a concluding sentence if appropriate."""
-        # Only add conclusion for certain query types
-        if query_concepts['question_type'] in ['reason', 'process']:
-            return "This summary represents the key points addressing your query based on the available information."
-        
-        return ""  # No conclusion for other query types
-    
-    def _generate_abstractive_summary(self, texts: List[str], query: str, query_concepts: Dict[str, Any], max_length: int) -> str:
-        """
-        Generate a summary using abstractive (generative) methods, which create new text instead of extracting.
-        
-        Args:
-            texts: List of preprocessed document texts
-            query: The user's query
-            query_concepts: Dictionary with query analysis
-            max_length: Target maximum length in words
-            
-        Returns:
-            Abstractive summary text
-        """
-        if not self.abstractive_enabled:
-            return self._generate_extractive_summary(texts, query, query_concepts, max_length)
-        
-        try:
-            # Combine texts with appropriate weighting based on query relevance
-            combined_text = self._prepare_text_for_abstractive(texts, query, query_concepts)
-            
-            # Ensure the combined text isn't too long for the model
-            # BART has a 1024 token limit for input
-            max_tokens = 1000
-            tokens = summarization_tokenizer(combined_text, return_tensors="pt")
-            if tokens.input_ids.shape[1] > max_tokens:
-                # If too long, use extractive summarization to reduce length first
-                # Create a shorter extractive summary to use as input
-                extractive_summary = self._generate_extractive_summary(texts, query, query_concepts, max_length=max_tokens//4)
-                combined_text = extractive_summary
-            
-            # Prepare prompt with query focus
-            introduction = ""
-            if query_concepts['question_type'] == 'definition':
-                if query_concepts['keywords']:
-                    introduction = f"Information about what {query_concepts['keywords'][0]} is: "
-            elif query_concepts['question_type'] == 'process':
-                if query_concepts['keywords']:
-                    introduction = f"Information about how {query_concepts['keywords'][0]} works: "
-            
-            # Append introduction if we have one
-            if introduction:
-                combined_text = introduction + combined_text
-            
-            # Generate summary
-            # Calculate max_new_tokens based on max_length
-            # Rule of thumb: 1 word ≈ 1.3 tokens for English
-            max_new_tokens = min(int(max_length * 1.3), 500)  # Cap at 500 tokens
-            
-            # Generate summary
-            summary_output = summarizer(
-                combined_text,
-                max_length=max_new_tokens,
-                min_length=int(max_new_tokens/3),  # At least 1/3 of max length
-                do_sample=False,  # Deterministic generation
-                truncation=True
-            )
-            
-            # Extract summary text
-            summary_text = summary_output[0]['summary_text']
-            
-            # Post-process summary
-            summary_text = self._post_process_abstractive_summary(summary_text, query, query_concepts)
-            
-            return summary_text
-            
-        except Exception as e:
             logger.error(f"Error generating abstractive summary: {str(e)}")
             # Fall back to extractive summarization
-            return self._generate_extractive_summary(texts, query, query_concepts, max_length)
+            return self._generate_extractive_summary("\n\n".join(texts), query_info, max_tokens)
     
-    def _prepare_text_for_abstractive(self, texts: List[str], query: str, query_concepts: Dict[str, Any]) -> str:
-        """Prepare text for abstractive summarization by filtering and organizing content."""
-        # Combine texts
-        combined_text = "\n\n".join(texts)
-        
-        # Extract key sentences
-        sentences = nltk.sent_tokenize(combined_text)
-        
-        # Get query terms for filtering
-        query_terms = set(query_concepts['keywords'])
-        entity_terms = set(entity for entity, _ in query_concepts['entities'])
-        all_query_terms = query_terms.union(entity_terms)
-        
-        # Filter to sentences with query relevance
-        if all_query_terms:
-            relevant_sentences = []
-            for sentence in sentences:
-                # Convert to lowercase for case-insensitive matching
-                lower_sentence = sentence.lower()
-                
-                # Check if any query term appears in the sentence
-                if any(term.lower() in lower_sentence for term in all_query_terms):
-                    relevant_sentences.append(sentence)
-                    
-            # If we have enough relevant sentences, use only those
-            if len(relevant_sentences) >= 3:
-                combined_text = " ".join(relevant_sentences)
-        
-        return combined_text
-    
-    def _post_process_abstractive_summary(self, summary: str, query: str, query_concepts: Dict[str, Any]) -> str:
-        """Clean up and improve the generated abstractive summary."""
-        # Clean up any tokenization artifacts
-        summary = re.sub(r'\s+', ' ', summary).strip()
-        
-        # Ensure first letter is capitalized
-        if summary and summary[0].islower():
-            summary = summary[0].upper() + summary[1:]
-        
-        # Ensure the summary ends with proper punctuation
-        if summary and summary[-1] not in ['.', '!', '?']:
-            summary += '.'
-        
-        # If summary is very short, combine with extractive approach
-        if len(summary.split()) < 25:
-            extractive_summary = self._generate_basic_summary(texts=[summary], query=query)
-            summary = summary + "\n\n" + extractive_summary
-        
-        return summary
-    
-    def _generate_basic_summary(self, texts: List[str], query: str) -> str:
-        """
-        Generate a basic summary using traditional extractive methods.
-        Used as a fallback when other methods fail.
-        """
-        if not texts:
-            return "No relevant information found."
-            
+    def _generate_extractive_summary(self, text, query_info, max_sentences=10):
+        """Generate an extractive summary using LexRank or LSA."""
         if not sumy_available:
-            # Ultra simple fallback
-            sentences = []
-            for text in texts:
-                sentences.extend(nltk.sent_tokenize(text))
+            # Simple extractive summarization
+            sentences = nltk.sent_tokenize(text)
             
-            # Take first 5 sentences as summary
-            if sentences:
-                return " ".join(sentences[:5])
-            else:
-                return "No relevant information found."
+            # Use TF-IDF to score sentences
+            vectorizer = TfidfVectorizer(stop_words='english')
+            tfidf_matrix = vectorizer.fit_transform(sentences)
+            
+            # Calculate query similarity if query is provided
+            query = query_info["original_query"]
+            query_vec = vectorizer.transform([query])
+            
+            # Score sentences by similarity to query
+            scores = cosine_similarity(query_vec, tfidf_matrix)[0]
+            
+            # Select top sentences
+            top_indices = np.argsort(scores)[-max_sentences:]
+            top_indices = sorted(top_indices)  # Sort by position to maintain document flow
+            
+            selected_sentences = [sentences[i] for i in top_indices]
+            summary = " ".join(selected_sentences)
+            
+            return summary
         
-        try:
-            # Combine texts
-            combined_text = "\n\n".join(texts)
+        # Use sumy for summarization
+        parser = PlaintextParser.from_string(text, Tokenizer(self.language))
+        
+        # Check if we have enough sentences
+        if len(parser.document.sentences) <= max_sentences:
+            return text
+        
+        # Combine LexRank and LSA for better results
+        lexrank_sentences = [str(s) for s in self.lexrank(parser.document, max_sentences)]
+        lsa_sentences = [str(s) for s in self.lsa(parser.document, max_sentences // 2)]
+        
+        # Combine and remove duplicates
+        all_sentences = []
+        all_sentences.extend(lexrank_sentences)
+        
+        for sentence in lsa_sentences:
+            if sentence not in all_sentences:
+                all_sentences.append(sentence)
+        
+        # Limit to max_sentences
+        selected_sentences = all_sentences[:max_sentences]
+        
+        # Reorder sentences to match their original order in the text
+        orig_sentences = nltk.sent_tokenize(text)
+        orig_order = {}
+        
+        for i, sent in enumerate(orig_sentences):
+            orig_order[sent] = i
+        
+        # Sort selected sentences by their original order
+        selected_sentences.sort(key=lambda s: orig_order.get(s, float('inf')))
+        
+        # Combine sentences into paragraphs
+        return self._format_sentences_into_paragraphs(selected_sentences)
+    
+    def _format_sentences_into_paragraphs(self, sentences, max_sentences_per_para=3):
+        """Format a list of sentences into coherent paragraphs."""
+        if not sentences:
+            return ""
             
-            # Parse the text
-            parser = PlaintextParser.from_string(combined_text, Tokenizer(self.language))
+        paragraphs = []
+        current_para = []
+        
+        for sent in sentences:
+            current_para.append(sent)
             
-            # Generate summary
-            summary_sentences = [str(s) for s in self.lexrank(parser.document, 5)]
-            
-            if not summary_sentences:
-                return "No relevant information could be extracted."
-                
-            return " ".join(summary_sentences)
-            
-        except Exception as e:
-            logger.error(f"Error generating basic summary: {str(e)}")
-            
-            # Ultra simple fallback
-            sentences = []
-            for text in texts:
-                sentences.extend(nltk.sent_tokenize(text)[:3])  # Take first 3 sentences from each text
-            
-            if sentences:
-                return " ".join(sentences[:5])  # Take at most 5 sentences total
-            else:
-                return "No relevant information found."
+            if len(current_para) >= max_sentences_per_para:
+                paragraphs.append(" ".join(current_para))
+                current_para = []
+        
+        # Add the last paragraph if not empty
+        if current_para:
+            paragraphs.append(" ".join(current_para))
+        
+        return "\n\n".join(paragraphs)
 
 
-class ConversationContext:
+class ConversationManager:
     """
-    Manages conversation history and context for multi-turn interactions.
-    Helps with follow-up questions and maintaining coherence across the conversation.
-    """
-    
-    def __init__(self, max_history: int = 5):
-        """
-        Initialize the conversation context.
-        
-        Args:
-            max_history: Maximum number of turns to keep in history
-        """
-        self.history = []
-        self.max_history = max_history
-        self.entities = {}  # Named entities mentioned in conversation
-        self.topics = {}  # Topics discussed with frequency counts
-    
-    def add_exchange(self, query: str, response: str, query_analysis: Dict = None, retrieved_docs: List[str] = None):
-        """
-        Add a query-response exchange to the conversation history.
-        
-        Args:
-            query: The user's query
-            response: The system's response
-            query_analysis: Optional analysis of the query
-            retrieved_docs: Optional list of retrieved document IDs
-        """
-        exchange = {
-            "query": query,
-            "response": response,
-            "timestamp": datetime.now().isoformat(),
-            "analysis": query_analysis,
-            "retrieved_docs": retrieved_docs
-        }
-        
-        # Update entities and topics from query analysis
-        if query_analysis:
-            # Add entities
-            if 'entities' in query_analysis:
-                for entity, entity_type in query_analysis['entities']:
-                    if entity in self.entities:
-                        self.entities[entity]['count'] += 1
-                    else:
-                        self.entities[entity] = {
-                            'type': entity_type,
-                            'count': 1,
-                            'first_seen': len(self.history)
-                        }
-            
-            # Add topics
-            if 'keywords' in query_analysis:
-                for keyword in query_analysis['keywords']:
-                    if keyword in self.topics:
-                        self.topics[keyword] += 1
-                    else:
-                        self.topics[keyword] = 1
-        
-        # Add to history
-        self.history.append(exchange)
-        
-        # Trim history if needed
-        if len(self.history) > self.max_history:
-            self.history = self.history[-self.max_history:]
-    
-    def get_context_for_query(self, query: str) -> Dict[str, Any]:
-        """
-        Get relevant context for the current query.
-        
-        Args:
-            query: The current user query
-            
-        Returns:
-            Dictionary with context information
-        """
-        # Check if this might be a follow-up question
-        is_followup = self._is_followup(query)
-        
-        # Get references to entities and topics from history
-        referenced_entities = self._get_referenced_entities(query)
-        active_topics = self._get_active_topics()
-        
-        # Get recent exchanges
-        recent_exchanges = self.history[-3:] if self.history else []
-        
-        # Create context dictionary
-        context = {
-            "is_followup": is_followup,
-            "referenced_entities": referenced_entities,
-            "active_topics": active_topics,
-            "recent_exchanges": recent_exchanges,
-            "conversation_length": len(self.history)
-        }
-        
-        return context
-    
-    def _is_followup(self, query: str) -> bool:
-        """Determine if a query is likely a follow-up question."""
-        if not self.history:
-            return False
-            
-        # Check for pronouns that might refer to previous context
-        followup_indicators = ['it', 'this', 'that', 'these', 'those', 'they', 'them', 'their']
-        query_words = query.lower().split()
-        
-        # If query is very short and contains followup indicators
-        if len(query_words) <= 5 and any(word in followup_indicators for word in query_words):
-            return True
-        
-        # If query starts with a verb or doesn't contain a named entity, might be followup
-        doc = nlp(query)
-        if len(doc) > 0 and doc[0].pos_ == 'VERB':
-            return True
-        
-        # If no entities in query but entities in history
-        query_has_entities = any(ent.label_ in ('PERSON', 'ORG', 'GPE', 'PRODUCT') for ent in doc.ents)
-        if not query_has_entities and self.entities:
-            return True
-        
-        return False
-    
-    def _get_referenced_entities(self, query: str) -> List[Dict[str, Any]]:
-        """Find entities from history that might be referenced in the query."""
-        if not self.entities:
-            return []
-            
-        query_doc = nlp(query)
-        query_tokens = [token.text.lower() for token in query_doc]
-        
-        # Check for pronouns that might refer to entities
-        has_pronouns = any(token.lower() in ['it', 'this', 'that', 'they', 'them', 'their'] 
-                          for token in query_tokens)
-        
-        # Get entities that might be referenced
-        referenced = []
-        
-        # If query has pronouns, consider recently mentioned entities
-        if has_pronouns and self.history:
-            # Get entities from most recent exchange
-            last_exchange = self.history[-1]
-            if 'analysis' in last_exchange and 'entities' in last_exchange['analysis']:
-                for entity, entity_type in last_exchange['analysis']['entities']:
-                    if entity in self.entities:
-                        referenced.append({
-                            'entity': entity,
-                            'type': entity_type,
-                            'relevance': 'high'
-                        })
-        
-        # Otherwise, check for partial matches with known entities
-        else:
-            for entity, info in self.entities.items():
-                # Check if entity words appear in the query
-                entity_words = entity.lower().split()
-                if any(word in query.lower() for word in entity_words if len(word) > 3):
-                    referenced.append({
-                        'entity': entity,
-                        'type': info['type'],
-                        'relevance': 'medium',
-                        'count': info['count']
-                    })
-        
-        return referenced
-    
-    def _get_active_topics(self) -> List[str]:
-        """Get currently active topics from conversation history."""
-        if not self.topics:
-            return []
-            
-        # Get topics sorted by frequency and recency
-        sorted_topics = sorted(self.topics.items(), key=lambda x: x[1], reverse=True)
-        
-        # Return top 5 topics
-        return [topic for topic, count in sorted_topics[:5]]
-    
-    def clear(self):
-        """Clear conversation history and context."""
-        self.history = []
-        self.entities = {}
-        self.topics = {}
-
-
-class EvaluationMetrics:
-    """
-    Provides methods for evaluating the performance of the RAG system.
-    Supports both automatic and user feedback-based metrics.
+    Manages conversation history, context, and user feedback to improve responses over time.
     """
     
     def __init__(self):
-        """Initialize the evaluation metrics."""
-        self.query_metrics = {}  # Metrics for individual queries
-        self.overall_metrics = {
-            "queries_processed": 0,
-            "successful_queries": 0,
-            "retrieval_precision": [],
-            "retrieval_recall": [],
-            "summary_quality": [],
-            "user_ratings": [],
-            "response_time": []
+        """Initialize the conversation manager."""
+        self.history = []
+        self.feedback = {}
+        self.session_id = str(uuid.uuid4())
+        self.user_preferences = {
+            "summary_length": "medium",
+            "detail_level": "balanced",
+            "include_sources": True
         }
     
-    def record_query_metrics(self, query_id: str, metrics: Dict[str, Any]):
-        """
-        Record metrics for a specific query.
+    def add_interaction(self, query, response, retrieved_docs, chunks):
+        """Add an interaction to the conversation history."""
+        interaction = {
+            "timestamp": datetime.now().isoformat(),
+            "query": query,
+            "response": response,
+            "doc_ids": [doc_id for doc_id in retrieved_docs],
+            "chunk_ids": [chunk.id for chunk, _ in chunks] if chunks else []
+        }
         
-        Args:
-            query_id: Unique identifier for the query
-            metrics: Dictionary of metrics to record
-        """
-        self.query_metrics[query_id] = metrics
-        
-        # Update overall metrics
-        self.overall_metrics["queries_processed"] += 1
-        
-        if metrics.get("success", False):
-            self.overall_metrics["successful_queries"] += 1
-            
-        if "retrieval_precision" in metrics:
-            self.overall_metrics["retrieval_precision"].append(metrics["retrieval_precision"])
-            
-        if "retrieval_recall" in metrics:
-            self.overall_metrics["retrieval_recall"].append(metrics["retrieval_recall"])
-            
-        if "summary_quality" in metrics:
-            self.overall_metrics["summary_quality"].append(metrics["summary_quality"])
-            
-        if "user_rating" in metrics:
-            self.overall_metrics["user_ratings"].append(metrics["user_rating"])
-            
-        if "response_time" in metrics:
-            self.overall_metrics["response_time"].append(metrics["response_time"])
+        self.history.append(interaction)
+        return len(self.history) - 1  # Return index of this interaction
     
-    def calculate_rouge(self, prediction: str, reference: str) -> Dict[str, float]:
-        """
-        Calculate ROUGE scores for a generated summary.
-        
-        Args:
-            prediction: Generated summary
-            reference: Reference (gold standard) summary
+    def add_feedback(self, interaction_id, feedback_type, value):
+        """Add user feedback for a specific interaction."""
+        if interaction_id < 0 or interaction_id >= len(self.history):
+            logger.error(f"Invalid interaction_id: {interaction_id}")
+            return False
             
-        Returns:
-            Dictionary with ROUGE scores
-        """
+        if interaction_id not in self.feedback:
+            self.feedback[interaction_id] = {}
+            
+        self.feedback[interaction_id][feedback_type] = value
+        return True
+    
+    def get_conversation_context(self, current_query, max_history=3):
+        """Get relevant conversation context for the current query."""
+        if not self.history:
+            return None
+            
+        # Only consider recent history
+        recent_history = self.history[-max_history:]
+        
+        # Extract previous queries and responses
+        context = {
+            "recent_queries": [item["query"] for item in recent_history],
+            "recent_responses": [item["response"] for item in recent_history],
+            "mentioned_docs": set()
+        }
+        
+        for item in recent_history:
+            for doc_id in item["doc_ids"]:
+                context["mentioned_docs"].add(doc_id)
+        
+        return context
+    
+    def update_preferences(self, preferences):
+        """Update user preferences."""
+        for key, value in preferences.items():
+            if key in self.user_preferences:
+                self.user_preferences[key] = value
+            else:
+                logger.warning(f"Unknown preference key: {key}")
+        
+        return self.user_preferences
+
+
+class EvaluationFramework:
+    """
+    Framework for evaluating the RAG system on benchmark datasets and custom test cases.
+    """
+    
+    def __init__(self, rag_system):
+        """Initialize the evaluation framework with the RAG system to evaluate."""
+        self.rag_system = rag_system
+        self.metrics = {
+            "retrieval": {},
+            "summary": {},
+            "overall": {}
+        }
+        
+        # Import ROUGE if available
         try:
             from rouge import Rouge
-            rouge = Rouge()
-            scores = rouge.get_scores(prediction, reference)[0]
-            
-            return {
-                "rouge-1": scores["rouge-1"]["f"],
-                "rouge-2": scores["rouge-2"]["f"],
-                "rouge-l": scores["rouge-l"]["f"]
-            }
+            self.rouge = Rouge()
+            self.rouge_available = True
         except:
-            # If ROUGE calculation fails, return zeros
-            return {
-                "rouge-1": 0.0,
-                "rouge-2": 0.0,
-                "rouge-l": 0.0
-            }
+            self.rouge_available = False
+            logger.warning("ROUGE metrics not available. Install 'rouge' package for summary evaluation.")
     
-    def get_retrieval_metrics(self, retrieved_docs: List[str], relevant_docs: List[str]) -> Dict[str, float]:
+    def evaluate(self, test_cases):
         """
-        Calculate retrieval metrics.
+        Evaluate the RAG system on a set of test cases.
         
         Args:
-            retrieved_docs: List of retrieved document IDs
-            relevant_docs: List of relevant document IDs (ground truth)
+            test_cases: List of dicts containing queries and expected results
             
         Returns:
-            Dictionary with retrieval metrics
+            Dict of evaluation metrics
         """
-        if not relevant_docs:
-            return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
-            
-        # Calculate precision
-        if retrieved_docs:
-            precision = len(set(retrieved_docs) & set(relevant_docs)) / len(retrieved_docs)
-        else:
-            precision = 0.0
-            
-        # Calculate recall
-        recall = len(set(retrieved_docs) & set(relevant_docs)) / len(relevant_docs)
-        
-        # Calculate F1
-        if precision + recall > 0:
-            f1 = 2 * precision * recall / (precision + recall)
-        else:
-            f1 = 0.0
-            
-        return {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1
+        results = {
+            "retrieval_precision": [],
+            "retrieval_recall": [],
+            "response_time": [],
+            "summary_rouge": [] if self.rouge_available else None
         }
-    
-    def record_user_feedback(self, query_id: str, rating: int, feedback: str = None):
-        """
-        Record user feedback for a query.
         
-        Args:
-            query_id: Unique identifier for the query
-            rating: User rating (1-5)
-            feedback: Optional textual feedback
-        """
-        if query_id in self.query_metrics:
-            self.query_metrics[query_id]["user_rating"] = rating
-            if feedback:
-                self.query_metrics[query_id]["user_feedback"] = feedback
+        for test_case in tqdm(test_cases, desc="Evaluating"):
+            query = test_case["query"]
+            expected_docs = test_case.get("relevant_docs", [])
+            reference_summary = test_case.get("reference_summary")
+            
+            # Process the query and time it
+            start_time = time.time()
+            response = self.rag_system.process_query(query)
+            elapsed = time.time() - start_time
+            
+            # Evaluate retrieval
+            if expected_docs:
+                retrieved_docs = response["retrieved_docs"]
                 
-            # Update overall metrics
-            self.overall_metrics["user_ratings"].append(rating)
-    
-    def get_overall_metrics(self) -> Dict[str, Any]:
-        """
-        Get overall system metrics.
+                # Calculate precision and recall
+                retrieved_set = set(retrieved_docs)
+                expected_set = set(expected_docs)
+                
+                true_positives = len(retrieved_set.intersection(expected_set))
+                precision = true_positives / len(retrieved_set) if retrieved_set else 0
+                recall = true_positives / len(expected_set) if expected_set else 0
+                
+                results["retrieval_precision"].append(precision)
+                results["retrieval_recall"].append(recall)
+            
+            # Evaluate summary
+            if reference_summary and self.rouge_available and "response" in response:
+                try:
+                    rouge_scores = self.rouge.get_scores(response["response"], reference_summary)
+                    results["summary_rouge"].append(rouge_scores[0])
+                except Exception as e:
+                    logger.error(f"Error calculating ROUGE scores: {str(e)}")
+            
+            # Record response time
+            results["response_time"].append(elapsed)
         
-        Returns:
-            Dictionary with aggregated metrics
-        """
+        # Calculate aggregate metrics
         metrics = {
-            "queries_processed": self.overall_metrics["queries_processed"],
-            "success_rate": (self.overall_metrics["successful_queries"] / 
-                           max(1, self.overall_metrics["queries_processed"]))
+            "avg_precision": sum(results["retrieval_precision"]) / len(results["retrieval_precision"]) if results["retrieval_precision"] else None,
+            "avg_recall": sum(results["retrieval_recall"]) / len(results["retrieval_recall"]) if results["retrieval_recall"] else None,
+            "avg_response_time": sum(results["response_time"]) / len(results["response_time"]) if results["response_time"] else None,
         }
         
-        # Calculate average metrics
-        if self.overall_metrics["retrieval_precision"]:
-            metrics["avg_retrieval_precision"] = sum(self.overall_metrics["retrieval_precision"]) / len(self.overall_metrics["retrieval_precision"])
+        # Add F1 score
+        if metrics["avg_precision"] and metrics["avg_recall"]:
+            precision = metrics["avg_precision"]
+            recall = metrics["avg_recall"]
+            if precision + recall > 0:
+                metrics["f1_score"] = 2 * precision * recall / (precision + recall)
+            else:
+                metrics["f1_score"] = 0
         
-        if self.overall_metrics["retrieval_recall"]:
-            metrics["avg_retrieval_recall"] = sum(self.overall_metrics["retrieval_recall"]) / len(self.overall_metrics["retrieval_recall"])
+        # Add ROUGE metrics if available
+        if self.rouge_available and results["summary_rouge"]:
+            avg_rouge_1 = sum(entry['rouge-1']['f'] for entry in results["summary_rouge"]) / len(results["summary_rouge"])
+            avg_rouge_2 = sum(entry['rouge-2']['f'] for entry in results["summary_rouge"]) / len(results["summary_rouge"])
+            avg_rouge_l = sum(entry['rouge-l']['f'] for entry in results["summary_rouge"]) / len(results["summary_rouge"])
+            
+            metrics["avg_rouge_1"] = avg_rouge_1
+            metrics["avg_rouge_2"] = avg_rouge_2
+            metrics["avg_rouge_l"] = avg_rouge_l
         
-        if self.overall_metrics["summary_quality"]:
-            metrics["avg_summary_quality"] = sum(self.overall_metrics["summary_quality"]) / len(self.overall_metrics["summary_quality"])
+        # Store metrics for later reference
+        self.metrics["retrieval"]["precision"] = metrics["avg_precision"]
+        self.metrics["retrieval"]["recall"] = metrics["avg_recall"]
+        if "f1_score" in metrics:
+            self.metrics["retrieval"]["f1"] = metrics["f1_score"]
         
-        if self.overall_metrics["user_ratings"]:
-            metrics["avg_user_rating"] = sum(self.overall_metrics["user_ratings"]) / len(self.overall_metrics["user_ratings"])
+        if self.rouge_available and "avg_rouge_l" in metrics:
+            self.metrics["summary"]["rouge_1"] = metrics["avg_rouge_1"]
+            self.metrics["summary"]["rouge_2"] = metrics["avg_rouge_2"]
+            self.metrics["summary"]["rouge_l"] = metrics["avg_rouge_l"]
         
-        if self.overall_metrics["response_time"]:
-            metrics["avg_response_time"] = sum(self.overall_metrics["response_time"]) / len(self.overall_metrics["response_time"])
+        self.metrics["overall"]["response_time"] = metrics["avg_response_time"]
         
         return metrics
     
-    def generate_evaluation_report(self) -> str:
+    def generate_report(self, metrics=None, output_path=None):
         """
-        Generate a human-readable evaluation report.
+        Generate an evaluation report with metrics and visualizations.
         
+        Args:
+            metrics: Metrics dict (if None, use the last evaluation metrics)
+            output_path: Path to save the report (if None, return the report as string)
+            
         Returns:
-            Formatted report string
+            Report string or path to the saved report
         """
-        overall_metrics = self.get_overall_metrics()
+        if metrics is None:
+            metrics = self.metrics
         
-        report = "# RAG System Evaluation Report\n\n"
+        # Create the report
+        report = []
+        report.append("# RAG System Evaluation Report")
+        report.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append("\n## Retrieval Performance")
         
-        # Overall statistics
-        report += "## Overall Performance\n\n"
-        report += f"- Total queries processed: {overall_metrics['queries_processed']}\n"
-        report += f"- Success rate: {overall_metrics['success_rate']:.2f}\n"
+        # Retrieval metrics
+        if "precision" in metrics["retrieval"]:
+            report.append(f"- Precision: {metrics['retrieval']['precision']:.4f}")
+        if "recall" in metrics["retrieval"]:
+            report.append(f"- Recall: {metrics['retrieval']['recall']:.4f}")
+        if "f1" in metrics["retrieval"]:
+            report.append(f"- F1 Score: {metrics['retrieval']['f1']:.4f}")
         
-        if "avg_retrieval_precision" in overall_metrics:
-            report += f"- Average retrieval precision: {overall_metrics['avg_retrieval_precision']:.2f}\n"
+        # Summary metrics
+        if metrics["summary"]:
+            report.append("\n## Summary Quality")
+            if "rouge_1" in metrics["summary"]:
+                report.append(f"- ROUGE-1: {metrics['summary']['rouge_1']:.4f}")
+            if "rouge_2" in metrics["summary"]:
+                report.append(f"- ROUGE-2: {metrics['summary']['rouge_2']:.4f}")
+            if "rouge_l" in metrics["summary"]:
+                report.append(f"- ROUGE-L: {metrics['summary']['rouge_l']:.4f}")
         
-        if "avg_retrieval_recall" in overall_metrics:
-            report += f"- Average retrieval recall: {overall_metrics['avg_retrieval_recall']:.2f}\n"
+        # Performance metrics
+        report.append("\n## System Performance")
+        if "response_time" in metrics["overall"]:
+            report.append(f"- Average Response Time: {metrics['overall']['response_time']:.4f} seconds")
         
-        if "avg_summary_quality" in overall_metrics:
-            report += f"- Average summary quality: {overall_metrics['avg_summary_quality']:.2f}\n"
+        # Generate visualizations if matplotlib is available
+        try:
+            if output_path:
+                self._generate_visualization(metrics, output_path)
+                report.append("\n## Visualizations")
+                report.append("See attached charts for visual representation of the metrics.")
+        except Exception as e:
+            logger.error(f"Error generating visualizations: {str(e)}")
         
-        if "avg_user_rating" in overall_metrics:
-            report += f"- Average user rating: {overall_metrics['avg_user_rating']:.2f}\n"
+        # Convert to string or save to file
+        report_str = "\n".join(report)
         
-        if "avg_response_time" in overall_metrics:
-            report += f"- Average response time: {overall_metrics['avg_response_time']:.2f} seconds\n"
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write(report_str)
+            return output_path
+        else:
+            return report_str
+    
+    def _generate_visualization(self, metrics, output_path):
+        """Generate visualization charts for metrics."""
+        # Create figure with multiple subplots
+        fig, axs = plt.subplots(2, 1, figsize=(10, 12))
         
-        # Recent queries analysis
-        report += "\n## Recent Queries\n\n"
+        # Plot 1: Retrieval Metrics
+        retrieval_metrics = []
+        values = []
         
-        recent_queries = list(self.query_metrics.items())[-5:]
-        for query_id, metrics in recent_queries:
-            report += f"### Query: {metrics.get('query', 'Unknown')}\n"
-            report += f"- Success: {metrics.get('success', False)}\n"
-            report += f"- Response time: {metrics.get('response_time', 0):.2f} seconds\n"
+        if "precision" in metrics["retrieval"]:
+            retrieval_metrics.append("Precision")
+            values.append(metrics["retrieval"]["precision"])
+        if "recall" in metrics["retrieval"]:
+            retrieval_metrics.append("Recall")
+            values.append(metrics["retrieval"]["recall"])
+        if "f1" in metrics["retrieval"]:
+            retrieval_metrics.append("F1 Score")
+            values.append(metrics["retrieval"]["f1"])
             
-            if "retrieval_precision" in metrics:
-                report += f"- Retrieval precision: {metrics['retrieval_precision']:.2f}\n"
+        if retrieval_metrics:
+            axs[0].bar(retrieval_metrics, values, color='skyblue')
+            axs[0].set_title('Retrieval Performance')
+            axs[0].set_ylim(0, 1)
+            axs[0].grid(axis='y', linestyle='--', alpha=0.7)
             
-            if "user_rating" in metrics:
-                report += f"- User rating: {metrics['user_rating']}\n"
-            
-            if "user_feedback" in metrics:
-                report += f"- User feedback: {metrics['user_feedback']}\n"
-            
-            report += "\n"
+            # Add values on top of bars
+            for i, v in enumerate(values):
+                axs[0].text(i, v + 0.02, f'{v:.2f}', ha='center')
         
-        report += "\n"
-        return report
+        # Plot 2: ROUGE Metrics if available
+        if metrics["summary"] and "rouge_1" in metrics["summary"]:
+            rouge_metrics = ['ROUGE-1', 'ROUGE-2', 'ROUGE-L']
+            rouge_values = [
+                metrics["summary"]["rouge_1"],
+                metrics["summary"]["rouge_2"],
+                metrics["summary"]["rouge_l"]
+            ]
+            
+            axs[1].bar(rouge_metrics, rouge_values, color='lightgreen')
+            axs[1].set_title('Summary Quality (ROUGE Metrics)')
+            axs[1].set_ylim(0, 1)
+            axs[1].grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # Add values on top of bars
+            for i, v in enumerate(rouge_values):
+                axs[1].text(i, v + 0.02, f'{v:.2f}', ha='center')
+        else:
+            # If ROUGE not available, plot response time
+            axs[1].bar(['Response Time (seconds)'], [metrics["overall"]["response_time"]], color='salmon')
+            axs[1].set_title('System Performance')
+            axs[1].grid(axis='y', linestyle='--', alpha=0.7)
+            axs[1].text(0, metrics["overall"]["response_time"] + 0.1, f'{metrics["overall"]["response_time"]:.2f}s', ha='center')
+        
+        plt.tight_layout()
+        
+        # Save to file
+        chart_path = os.path.splitext(output_path)[0] + '_charts.png'
+        plt.savefig(chart_path)
+        plt.close()
+        
+        return chart_path
 
 
 class AdvancedRAGSystem:
     """
-    Main RAG system that integrates all components for document processing,
-    retrieval, summarization, and conversation management.
+    Advanced Retrieval-Augmented Generation system integrating all components for
+    intelligent document retrieval, processing, and summarization.
     """
     
     def __init__(self, knowledge_base_path: str):
-        """
-        Initialize the advanced RAG system.
-        
-        Args:
-            knowledge_base_path: Path to the knowledge base directory
-        """
-        self.knowledge_base_path = knowledge_base_path
+        """Initialize the advanced RAG system."""
+        logger.info(f"Initializing AdvancedRAGSystem with knowledge base path: {knowledge_base_path}")
         
         # Create knowledge base directory if it doesn't exist
         if not os.path.exists(knowledge_base_path):
@@ -2629,541 +1746,498 @@ class AdvancedRAGSystem:
         
         # Initialize components
         self.document_processor = DocumentProcessor(knowledge_base_path)
-        self.vector_store = VectorStore()
-        self.hybrid_searcher = HybridSearcher(self.vector_store)
+        self.indexer = SemanticIndexer(use_faiss=faiss_available)
         self.query_processor = QueryProcessor()
-        self.summary_generator = ImprovedSummaryGenerator()
-        self.conversation_context = ConversationContext()
-        self.evaluation_metrics = EvaluationMetrics()
+        self.summarizer = AbstractiveSummarizer()
+        self.conversation_manager = ConversationManager()
         
-        # System state
+        # Load and index documents
+        self.knowledge_base_path = knowledge_base_path
+        self.documents = {}
         self.initialized = False
-        self.has_documents = False
     
-    def initialize(self):
-        """Initialize the system by loading documents and building indexes."""
+    def initialize(self, force_reload=False):
+        """Initialize the system by loading and indexing documents."""
+        if self.initialized and not force_reload:
+            logger.info("System already initialized")
+            return
+        
         # Load documents
-        logger.info("Initializing the RAG system...")
-        documents = self.document_processor.load_all_documents()
+        logger.info("Loading documents from knowledge base...")
+        self.documents = self.document_processor.load_all_documents()
         
-        if documents:
-            # Add documents to vector store
-            self.vector_store.add_documents(list(documents.values()))
-            
-            # Initialize hybrid searcher
-            all_chunks = []
-            for doc in documents.values():
-                all_chunks.extend(doc.chunks)
-            
-            self.hybrid_searcher.initialize(all_chunks)
-            
-            self.has_documents = True
-            self.initialized = True
-            logger.info(f"System initialized with {len(documents)} documents and {len(all_chunks)} chunks")
-        else:
-            logger.warning("No documents found in knowledge base. System initialized with empty state.")
-            self.initialized = True
+        if not self.documents:
+            logger.warning("No documents loaded from knowledge base!")
+            return
+        
+        # Create index
+        logger.info("Creating semantic index...")
+        self.indexer.index_documents(self.documents)
+        
+        self.initialized = True
+        logger.info("System initialization complete")
     
-    def process_query(self, query: str, conversation_id: str = None) -> Dict[str, Any]:
+    def add_document(self, file_path):
         """
-        Process a user query and generate a response.
-        
-        Args:
-            query: The user's query
-            conversation_id: Optional conversation identifier for context
-            
-        Returns:
-            Dictionary with query results
-        """
-        # Ensure system is initialized
-        if not self.initialized:
-            self.initialize()
-            
-        # Check if we have documents
-        if not self.has_documents:
-            return {
-                "success": False,
-                "error": "No documents in knowledge base. Please add documents before querying.",
-                "query": query
-            }
-        
-        # Start timing for performance metrics
-        start_time = time.time()
-        
-        # Generate a query ID
-        query_id = f"q_{str(uuid.uuid4())[:8]}"
-        
-        try:
-            # Get conversation context if available
-            context = self.conversation_context.get_context_for_query(query)
-            
-            # Process and analyze query
-            processed_query = self.query_processor.process_query(query, context)
-            
-            # Perform hybrid search
-            search_results = self.hybrid_searcher.search(
-                processed_query["expanded_query"],
-                k=7,  # Retrieve more results for better coverage
-                semantic_weight=0.7  # Weight semantic search higher
-            )
-            
-            if not search_results:
-                logger.warning(f"No search results found for query: {query}")
-                return {
-                    "success": False,
-                    "error": "No relevant information found in the knowledge base.",
-                    "query": query,
-                    "query_id": query_id,
-                    "processed_query": processed_query
-                }
-            
-            # Extract relevant texts from search results
-            retrieved_chunks = [chunk for chunk, _ in search_results]
-            retrieved_docs = list(set(chunk.document.id for chunk in retrieved_chunks))
-            retrieved_texts = [chunk.text for chunk in retrieved_chunks]
-            
-            # Generate summary
-            summary = self.summary_generator.generate_summary(
-                retrieved_texts,
-                processed_query["original_query"],
-                max_length=500,  # Target summary length
-                use_abstractive=None  # Auto-decide based on content
-            )
-            
-            # Extract key terms
-            all_content = " ".join(retrieved_texts)
-            key_terms = self.document_processor.extract_key_terms(all_content)
-            
-            # Format response
-            response = self._format_response(
-                summary, 
-                key_terms, 
-                processed_query["original_query"],
-                processed_query["analysis"]
-            )
-            
-            # Calculate response time
-            response_time = time.time() - start_time
-            
-            # Add to conversation context
-            self.conversation_context.add_exchange(
-                query=query,
-                response=response,
-                query_analysis=processed_query["analysis"],
-                retrieved_docs=retrieved_docs
-            )
-            
-            # Record metrics
-            self.evaluation_metrics.record_query_metrics(
-                query_id=query_id,
-                metrics={
-                    "query": query,
-                    "success": True,
-                    "response_time": response_time,
-                    "retrieval_count": len(retrieved_chunks),
-                    "doc_count": len(retrieved_docs)
-                }
-            )
-            
-            # Build result dictionary
-            result = {
-                "success": True,
-                "query": query,
-                "query_id": query_id,
-                "response": response,
-                "retrieved_chunks": retrieved_chunks,
-                "retrieved_docs": retrieved_docs,
-                "processed_query": processed_query,
-                "execution_time": response_time
-            }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error processing query: {str(e)}")
-            
-            # Record failed query
-            self.evaluation_metrics.record_query_metrics(
-                query_id=query_id,
-                metrics={
-                    "query": query,
-                    "success": False,
-                    "error": str(e),
-                    "response_time": time.time() - start_time
-                }
-            )
-            
-            return {
-                "success": False,
-                "error": f"An error occurred while processing your query: {str(e)}",
-                "query": query,
-                "query_id": query_id
-            }
-    
-    def _format_response(self, summary: str, key_terms: List[str], query: str, query_analysis: Dict[str, Any]) -> str:
-        """Format the final response with summary and key terms."""
-        response = f"# Summary: {query}\n\n"
-        response += summary
-        
-        if key_terms:
-            response += "\n\n## Key Terms\n"
-            for term in key_terms:
-                # Capitalize the first letter of each term
-                formatted_term = term[0].upper() + term[1:] if term else ""
-                response += f"- {formatted_term}\n"
-        
-        return response
-    
-    def add_document(self, file_path: str) -> Dict[str, Any]:
-        """
-        Add a new document to the knowledge base.
+        Add a new document to the knowledge base and update the index.
         
         Args:
             file_path: Path to the document file
             
         Returns:
-            Dictionary with status information
+            Document ID if successful, None otherwise
         """
         # Ensure system is initialized
         if not self.initialized:
             self.initialize()
+        
+        # Load and process the document
+        document = self.document_processor.load_document(file_path)
+        if not document:
+            return None
+        
+        # Create chunks
+        document.create_chunks(self.document_processor.chunker)
+        
+        # Add to documents dictionary
+        self.documents[document.id] = document
+        
+        # Update index
+        self.indexer.index_documents({document.id: document})
+        
+        return document.id
+    
+    def process_query(self, query, use_conversation_history=True, conversation_id=None):
+        """
+        Process a query and generate a response.
+        
+        Args:
+            query: The user's query
+            use_conversation_history: Whether to use conversation history for context
+            conversation_id: ID of the conversation (if None, use default conversation)
             
-        try:
-            # Process document
-            document = self.document_processor.load_document(file_path)
-            
-            if not document:
-                return {
-                    "success": False,
-                    "error": f"Failed to load document: {file_path}",
-                    "file_path": file_path
-                }
-            
-            # Add to vector store
-            self.vector_store.add_documents([document])
-            
-            # Update hybrid searcher
-            self.hybrid_searcher.initialize(document.chunks)
-            
-            self.has_documents = True
-            
-            return {
-                "success": True,
-                "message": f"Document added successfully: {os.path.basename(file_path)}",
-                "document_id": document.id,
-                "chunk_count": len(document.chunks)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error adding document {file_path}: {str(e)}")
+        Returns:
+            Dict containing query results, response, etc.
+        """
+        # Ensure system is initialized
+        if not self.initialized:
+            self.initialize()
+        
+        if not self.documents:
             return {
                 "success": False,
-                "error": f"Error adding document: {str(e)}",
-                "file_path": file_path
+                "error": "No documents in knowledge base",
+                "query": query,
+                "retrieved_docs": []
             }
-    
-    def generate_pdf_report(self, query: str, response: str, retrieved_docs: List[str]) -> str:
-        """
-        Generate a PDF report of the response.
         
-        Args:
-            query: User query
-            response: System response
-            retrieved_docs: List of retrieved document IDs
-            
-        Returns:
-            Path to the generated PDF file
-        """
-        # Create a temporary directory for the PDF
-        logger.info("Generating PDF report")
+        # Process the query to understand intent, expand terms, etc.
+        query_info = self.query_processor.process_query(query)
+        logger.info(f"Processed query. Intent: {query_info['intent']}, expanded: {query_info['expanded_query']}")
         
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_path = os.path.join(temp_dir, f"response_{timestamp}.pdf")
-                
-                # Create a PDF document
-                doc = SimpleDocTemplate(
-                    output_path,
-                    pagesize=letter,
-                    rightMargin=72,
-                    leftMargin=72,
-                    topMargin=72,
-                    bottomMargin=72
-                )
-                
-                # Create styles
-                styles = getSampleStyleSheet()
-                styles.add(ParagraphStyle(
-                    name='Justify',
-                    fontName='Helvetica',
-                    fontSize=11,
-                    leading=14,
-                    alignment=TA_JUSTIFY
-                ))
-                
-                # Add title style
-                title_style = ParagraphStyle(
-                    name='Title',
-                    fontName='Helvetica-Bold',
-                    fontSize=16,
-                    leading=20,
-                    alignment=TA_CENTER,
-                    spaceAfter=20
-                )
-                
-                # Create elements for the PDF
-                elements = []
-                
-                # Add title
-                elements.append(Paragraph(f"Query: {query}", title_style))
-                elements.append(Spacer(1, 0.25 * inch))
-                
-                # Process markdown in response
-                paragraphs = response.split("\n\n")
-                
-                for paragraph in paragraphs:
-                    if paragraph.startswith("# "):
-                        # Main heading
-                        heading_text = paragraph[2:].strip()
-                        elements.append(Paragraph(heading_text, styles['Heading1']))
-                        elements.append(Spacer(1, 0.15 * inch))
-                    elif paragraph.startswith("## "):
-                        # Subheading
-                        subheading_text = paragraph[3:].strip()
-                        elements.append(Paragraph(subheading_text, styles['Heading2']))
-                        elements.append(Spacer(1, 0.1 * inch))
-                    elif paragraph.startswith("- "):
-                        # List item
-                        list_text = paragraph[2:].strip()
-                        elements.append(Paragraph("• " + list_text, styles['Normal']))
-                        elements.append(Spacer(1, 0.05 * inch))
-                    else:
-                        # Regular paragraph
-                        elements.append(Paragraph(paragraph, styles['Justify']))
-                        elements.append(Spacer(1, 0.1 * inch))
-                
-                # Add sources
-                doc_names = []
-                for doc_id in retrieved_docs:
-                    if doc_id in self.document_processor.documents:
-                        doc = self.document_processor.documents[doc_id]
-                        doc_names.append(doc.metadata.get("filename", doc_id))
-                
-                if doc_names:
-                    elements.append(Paragraph("Sources", styles['Heading2']))
-                    elements.append(Spacer(1, 0.1 * inch))
-                    
-                    for name in doc_names:
-                        elements.append(Paragraph("• " + name, styles['Normal']))
-                        elements.append(Spacer(1, 0.05 * inch))
-                
-                # Add footer with timestamp
-                footer_text = f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                elements.append(Spacer(1, 0.5 * inch))
-                elements.append(Paragraph(footer_text, styles['Normal']))
-                
-                # Build the PDF
-                try:
-                    doc.build(elements)
-                except AttributeError as e:
-                    logger.error(f"Error building PDF: {str(e)}")
-                    if "'str' object has no attribute 'build'" in str(e):
-                        logger.error("This likely indicates an issue with reportlab's SimpleDocTemplate initialization")
-                        # Try an alternative approach
-                        doc = SimpleDocTemplate(output_path)
-                        doc.build(elements)
-                
-                # In Vertex AI Workbench notebook environment
-                try:
-                    final_path = f"/home/jupyter/response_{timestamp}.pdf"
-                    os.system(f"cp {output_path} {final_path}")
-                    return final_path
-                except Exception as ex:
-                    logger.error(f"Error copying PDF to final location: {str(ex)}")
-                    return output_path
-                
-        except Exception as e:
-            logger.error(f"Error generating PDF report: {str(e)}")
-            return f"Error generating PDF: {str(e)}"
-    
-    def save_state(self, directory: str = None):
-        """
-        Save the system state to disk.
+        # Get conversation context if enabled
+        context = None
+        if use_conversation_history:
+            context = self.conversation_manager.get_conversation_context(query)
         
-        Args:
-            directory: Optional directory to save state. If None, uses knowledge_base_path.
-        """
-        if directory is None:
-            directory = os.path.join(self.knowledge_base_path, "system_state")
-            
-        os.makedirs(directory, exist_ok=True)
+        # Retrieve relevant chunks using the expanded query
+        search_query = query_info["expanded_query"]
+        relevant_chunks = self.indexer.hybrid_search(search_query, top_k=10)
         
-        # Save vector store
-        self.vector_store.save(os.path.join(directory, "vector_store.pkl"))
+        if not relevant_chunks:
+            return {
+                "success": False,
+                "error": "No relevant information found",
+                "query": query,
+                "query_info": query_info,
+                "retrieved_docs": []
+            }
         
-        # Save system metadata
-        metadata = {
-            "timestamp": datetime.now().isoformat(),
-            "document_count": len(self.document_processor.documents),
-            "chunk_count": len(self.vector_store.chunks),
-            "has_documents": self.has_documents,
-            "initialized": self.initialized
+        # Get document IDs for retrieved chunks
+        retrieved_docs = []
+        seen_docs = set()
+        
+        for chunk, score in relevant_chunks:
+            doc_id = chunk.document.id
+            if doc_id not in seen_docs:
+                retrieved_docs.append(doc_id)
+                seen_docs.add(doc_id)
+        
+        # Generate summary from retrieved chunks
+        summary = self.summarizer.generate_summary(relevant_chunks, query_info)
+        
+        # Extract source information
+        sources = []
+        for chunk, _ in relevant_chunks[:5]:  # Limit to top 5 sources
+            doc = chunk.document
+            source = {
+                "id": doc.id,
+                "filename": doc.metadata.get("filename", "Unknown"),
+                "chunk_id": chunk.id,
+                "relevance": "high" if _ > 0.7 else "medium" if _ > 0.4 else "low"
+            }
+            sources.append(source)
+        
+        # Create response
+        response = {
+            "success": True,
+            "query": query,
+            "query_info": query_info,
+            "response": summary,
+            "retrieved_docs": retrieved_docs,
+            "sources": sources
         }
         
-        with open(os.path.join(directory, "metadata.json"), 'w') as f:
-            json.dump(metadata, f, indent=2)
-            
-        logger.info(f"System state saved to {directory}")
+        # Add to conversation history
+        self.conversation_manager.add_interaction(query, summary, retrieved_docs, relevant_chunks)
         
-        return directory
+        return response
     
-    @classmethod
-    def load_state(cls, directory: str, knowledge_base_path: str = None):
+    def generate_pdf_report(self, query, response, retrieved_docs, output_path=None):
         """
-        Load a system from saved state.
+        Generate a PDF report containing the query, response, and sources.
         
         Args:
-            directory: Directory with saved state
-            knowledge_base_path: Optional knowledge base path. If None, uses path from metadata.
+            query: The user's query
+            response: The generated response
+            retrieved_docs: List of retrieved document IDs
+            output_path: Path to save the PDF (if None, use a default location)
             
         Returns:
-            AdvancedRAGSystem instance
+            Path to the generated PDF
         """
-        # Load metadata
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"rag_report_{timestamp}.pdf"
+        
         try:
-            with open(os.path.join(directory, "metadata.json"), 'r') as f:
-                metadata = json.load(f)
-        except FileNotFoundError:
-            logger.error(f"Metadata file not found in {directory}")
-            raise ValueError(f"Invalid state directory: {directory}")
+            # Create a PDF document
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
             
-        # Create new system
-        if knowledge_base_path is None:
-            knowledge_base_path = os.path.dirname(directory)
+            # Create styles
+            styles = getSampleStyleSheet()
+            styles.add(ParagraphStyle(
+                name='Justify',
+                fontName='Helvetica',
+                fontSize=10,
+                leading=14,
+                alignment=TA_JUSTIFY
+            ))
             
-        system = cls(knowledge_base_path)
+            # Title style
+            title_style = styles['Heading1']
+            title_style.alignment = TA_CENTER
+            
+            # Create elements for the PDF
+            elements = []
+            
+            # Add title
+            elements.append(Paragraph("Question & Answer Report", title_style))
+            elements.append(Spacer(1, 0.5 * inch))
+            
+            # Add query
+            elements.append(Paragraph("Query:", styles['Heading2']))
+            elements.append(Paragraph(query, styles['Normal']))
+            elements.append(Spacer(1, 0.25 * inch))
+            
+            # Add response
+            elements.append(Paragraph("Response:", styles['Heading2']))
+            
+            # Process response text into paragraphs
+            response_paragraphs = response.split("\n\n")
+            for para in response_paragraphs:
+                elements.append(Paragraph(para, styles['Justify']))
+                elements.append(Spacer(1, 0.1 * inch))
+            
+            elements.append(Spacer(1, 0.25 * inch))
+            
+            # Add sources
+            elements.append(Paragraph("Sources:", styles['Heading2']))
+            
+            # Create a list of source documents
+            for doc_id in retrieved_docs:
+                if doc_id in self.documents:
+                    doc = self.documents[doc_id]
+                    filename = doc.metadata.get("filename", "Unknown")
+                    elements.append(Paragraph(f"• {filename}", styles['Normal']))
+            
+            elements.append(Spacer(1, 0.5 * inch))
+            
+            # Add footer with timestamp
+            footer_text = f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            elements.append(Paragraph(footer_text, styles['Normal']))
+            
+            # Build the PDF
+            doc.build(elements)
+            
+            logger.info(f"PDF report generated at: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error generating PDF report: {str(e)}")
+            return None
+    
+    def save_state(self, path=None):
+        """
+        Save the system state to a file.
         
-        # Load vector store
-        vector_store_path = os.path.join(directory, "vector_store.pkl")
-        if os.path.exists(vector_store_path):
-            try:
-                system.vector_store = VectorStore.load(vector_store_path)
-                
-                # Reconstruct document processor's documents from vector store
-                system.document_processor.documents = system.vector_store.documents
-                
-                # Update hybrid searcher
-                all_chunks = []
-                for doc in system.document_processor.documents.values():
-                    all_chunks.extend(doc.chunks)
-                
-                system.hybrid_searcher = HybridSearcher(system.vector_store)
-                system.hybrid_searcher.initialize(all_chunks)
-                
-                system.has_documents = bool(system.document_processor.documents)
-                system.initialized = True
-                
-                logger.info(f"System state loaded from {directory}")
-                
-            except Exception as e:
-                logger.error(f"Error loading vector store: {str(e)}")
-                raise
-        else:
-            logger.warning(f"Vector store file not found in {directory}")
-            system.initialize()
+        Args:
+            path: Path to save the state (if None, use a default location)
+            
+        Returns:
+            Path to the saved state file
+        """
+        if path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = f"rag_system_state_{timestamp}.pkl"
         
-        return system
+        try:
+            # Create a state dictionary with necessary components
+            state = {
+                "knowledge_base_path": self.knowledge_base_path,
+                "documents": {doc_id: doc.to_dict() for doc_id, doc in self.documents.items()},
+                "conversation_history": self.conversation_manager.history,
+                "conversation_feedback": self.conversation_manager.feedback,
+                "user_preferences": self.conversation_manager.user_preferences,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Save to file
+            with open(path, 'wb') as f:
+                pickle.dump(state, f)
+            
+            logger.info(f"System state saved to: {path}")
+            return path
+            
+        except Exception as e:
+            logger.error(f"Error saving system state: {str(e)}")
+            return None
+    
+    def load_state(self, path):
+        """
+        Load the system state from a file.
+        
+        Args:
+            path: Path to the state file
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Load state from file
+            with open(path, 'rb') as f:
+                state = pickle.load(f)
+            
+            # Validate state
+            if "knowledge_base_path" not in state or "documents" not in state:
+                logger.error("Invalid state file: missing required components")
+                return False
+            
+            # Restore knowledge base path
+            self.knowledge_base_path = state["knowledge_base_path"]
+            
+            # Restore documents
+            self.documents = {}
+            for doc_id, doc_dict in state["documents"].items():
+                self.documents[doc_id] = Document.from_dict(doc_dict)
+            
+            # Restore conversation history and feedback
+            if "conversation_history" in state:
+                self.conversation_manager.history = state["conversation_history"]
+            if "conversation_feedback" in state:
+                self.conversation_manager.feedback = state["conversation_feedback"]
+            if "user_preferences" in state:
+                self.conversation_manager.user_preferences = state["user_preferences"]
+            
+            # Reindex documents
+            self.indexer.index_documents(self.documents)
+            
+            self.initialized = True
+            logger.info(f"System state loaded from: {path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading system state: {str(e)}")
+            return False
 
 
 # Main function to run the RAG system
 def main():
-    """Main function to run the RAG system."""
-    KNOWLEDGE_BASE_PATH = "knowledge_base_docs"
+    """Main function to run the advanced RAG system."""
+    import argparse
     
-    print(f"Initializing Advanced RAG system with knowledge base path: {KNOWLEDGE_BASE_PATH}")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Advanced RAG System")
+    parser.add_argument('--knowledge_base', type=str, default="knowledge_base_docs",
+                      help="Path to the knowledge base directory")
+    parser.add_argument('--interactive', action='store_true',
+                      help="Run in interactive mode")
+    parser.add_argument('--query', type=str, 
+                      help="Process a single query")
+    parser.add_argument('--add_document', type=str,
+                      help="Add a document to the knowledge base")
+    parser.add_argument('--save_state', type=str,
+                      help="Save system state to file")
+    parser.add_argument('--load_state', type=str,
+                      help="Load system state from file")
+    parser.add_argument('--output', type=str,
+                      help="Output path for reports")
+    
+    args = parser.parse_args()
     
     # Initialize the RAG system
-    rag_system = AdvancedRAGSystem(KNOWLEDGE_BASE_PATH)
-    rag_system.initialize()
+    print(f"Initializing AdvancedRAGSystem with knowledge base: {args.knowledge_base}")
+    rag_system = AdvancedRAGSystem(args.knowledge_base)
     
-    # Example usage
-    while True:
-        query = input("\nEnter your query (or 'exit' to quit): ")
-        
-        if query.lower() == 'exit':
-            break
-        
-        print("\nProcessing your query...\n")
-        
-        # Process the query
-        result = rag_system.process_query(query)
+    # Load state if specified
+    if args.load_state:
+        success = rag_system.load_state(args.load_state)
+        if not success:
+            print(f"Failed to load state from: {args.load_state}")
+            return
+    else:
+        rag_system.initialize()
+    
+    # Add document if specified
+    if args.add_document:
+        doc_id = rag_system.add_document(args.add_document)
+        if doc_id:
+            print(f"Document added successfully. ID: {doc_id}")
+        else:
+            print(f"Failed to add document: {args.add_document}")
+    
+    # Process a single query if specified
+    if args.query:
+        result = rag_system.process_query(args.query)
         
         if result["success"]:
-            print("=" * 80)
-            print("RESPONSE:")
+            print("\n" + "=" * 80)
+            print("QUERY:", args.query)
             print("-" * 80)
+            print("RESPONSE:")
             print(result["response"])
+            print("-" * 80)
+            print("SOURCES:")
+            for doc_id in result["retrieved_docs"]:
+                if doc_id in rag_system.documents:
+                    print(f"- {rag_system.documents[doc_id].metadata.get('filename', doc_id)}")
             print("=" * 80)
-            print(f"\nSources: {', '.join([chunk.document.metadata.get('filename', chunk.document.id) for chunk in result['retrieved_chunks'][:3]])}")
-            print(f"Execution time: {result['execution_time']:.2f} seconds")
             
-            # Generate PDF report
-            try:
+            # Generate PDF report if output path specified
+            if args.output:
                 pdf_path = rag_system.generate_pdf_report(
-                    query,
-                    result["response"],
-                    result["retrieved_docs"]
+                    args.query, 
+                    result["response"], 
+                    result["retrieved_docs"], 
+                    args.output
                 )
-                print(f"\nPDF report generated at: {pdf_path}")
-            except Exception as e:
-                print(f"\nError generating PDF report: {str(e)}")
+                if pdf_path:
+                    print(f"\nPDF report generated at: {pdf_path}")
         else:
-            print(f"Error: {result.get('error', 'Unknown error')}")
+            print(f"Error: {result['error']}")
     
-    # Save system state before exiting
-    try:
-        state_dir = rag_system.save_state()
-        print(f"\nSystem state saved to: {state_dir}")
-    except Exception as e:
-        print(f"\nError saving system state: {str(e)}")
+    # Run in interactive mode
+    if args.interactive:
+        print("\nEntering interactive mode. Type 'exit' to quit, 'help' for commands.")
+        
+        while True:
+            query = input("\nEnter your query: ")
+            
+            if query.lower() == 'exit':
+                break
+            elif query.lower() == 'help':
+                print("\nAvailable commands:")
+                print("  help          - Show this help message")
+                print("  exit          - Exit the program")
+                print("  add <path>    - Add a document to the knowledge base")
+                print("  save <path>   - Save system state to file")
+                print("  load <path>   - Load system state from file")
+                print("  pdf <path>    - Generate PDF report for the last query")
+                continue
+            elif query.lower().startswith('add '):
+                doc_path = query[4:].strip()
+                doc_id = rag_system.add_document(doc_path)
+                if doc_id:
+                    print(f"Document added successfully. ID: {doc_id}")
+                else:
+                    print(f"Failed to add document: {doc_path}")
+                continue
+            elif query.lower().startswith('save '):
+                save_path = query[5:].strip()
+                saved_path = rag_system.save_state(save_path)
+                if saved_path:
+                    print(f"System state saved to: {saved_path}")
+                else:
+                    print("Failed to save system state")
+                continue
+            elif query.lower().startswith('load '):
+                load_path = query[5:].strip()
+                success = rag_system.load_state(load_path)
+                if success:
+                    print(f"System state loaded from: {load_path}")
+                else:
+                    print(f"Failed to load system state from: {load_path}")
+                continue
+            elif query.lower().startswith('pdf '):
+                pdf_path = query[4:].strip()
+                
+                # Check if there's a previous query
+                if not rag_system.conversation_manager.history:
+                    print("No previous query to generate a report for")
+                    continue
+                
+                last_interaction = rag_system.conversation_manager.history[-1]
+                pdf_path = rag_system.generate_pdf_report(
+                    last_interaction["query"],
+                    last_interaction["response"],
+                    last_interaction["doc_ids"],
+                    pdf_path
+                )
+                
+                if pdf_path:
+                    print(f"PDF report generated at: {pdf_path}")
+                else:
+                    print("Failed to generate PDF report")
+                continue
+            
+            # Process the query
+            result = rag_system.process_query(query)
+            
+            if result["success"]:
+                print("\n" + "=" * 80)
+                print("RESPONSE:")
+                print(result["response"])
+                print("-" * 80)
+                print("SOURCES:")
+                for doc_id in result["retrieved_docs"]:
+                    if doc_id in rag_system.documents:
+                        print(f"- {rag_system.documents[doc_id].metadata.get('filename', doc_id)}")
+                print("=" * 80)
+            else:
+                print(f"Error: {result['error']}")
+    
+    # Save state if specified
+    if args.save_state:
+        saved_path = rag_system.save_state(args.save_state)
+        if saved_path:
+            print(f"System state saved to: {saved_path}")
+        else:
+            print(f"Failed to save system state to: {args.save_state}")
 
 
 # For use in a Jupyter notebook
 def create_rag_system(knowledge_base_path="knowledge_base_docs"):
-    """Create and return a RAG system instance for use in a notebook."""
-    system = AdvancedRAGSystem(knowledge_base_path)
-    system.initialize()
-    return system
-
-
-def process_query_and_generate_pdf(rag_system, query):
-    """Process a query and generate a PDF report."""
-    result = rag_system.process_query(query)
-    
-    if result["success"]:
-        print("=" * 80)
-        print("RESPONSE:")
-        print("-" * 80)
-        print(result["response"])
-        print("=" * 80)
-        print(f"\nSources: {', '.join([chunk.document.metadata.get('filename', chunk.document.id) for chunk in result['retrieved_chunks'][:3]])}")
-        
-        # Generate PDF report
-        try:
-            pdf_path = rag_system.generate_pdf_report(
-                query,
-                result["response"],
-                result["retrieved_docs"]
-            )
-            print(f"\nPDF report generated at: {pdf_path}")
-            return result["response"], pdf_path
-        except Exception as e:
-            print(f"\nError generating PDF report: {str(e)}")
-            return result["response"], None
-    else:
-        print(f"Error: {result.get('error', 'Unknown error')}")
-        return None, None
+    """Create an advanced RAG system for use in a Jupyter notebook."""
+    rag_system = AdvancedRAGSystem(knowledge_base_path)
+    rag_system.initialize()
+    return rag_system
 
 
 # Run the system if executed directly
