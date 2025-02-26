@@ -1,4 +1,159 @@
 # project
+
+def generate_pdf_report(self, query: str, response: str, retrieved_chunks: List[DocumentChunk]) -> str:
+    """
+    Generate a PDF report of the response with improved error handling.
+    
+    Args:
+        query: The original query
+        response: The generated response text
+        retrieved_chunks: List of retrieved document chunks
+        
+    Returns:
+        Path to the generated PDF file or error message
+    """
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT
+    
+    logger.info("Generating PDF report")
+    
+    # Create a filename based on timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"rag_response_{timestamp}.pdf"
+    
+    # Try multiple potential locations
+    potential_paths = [
+        os.path.join(os.getcwd(), filename),  # Current working directory
+        os.path.join(os.path.expanduser("~"), filename),  # User's home directory
+        os.path.join(tempfile.gettempdir(), filename)  # System temp directory
+    ]
+    
+    # Try Vertex AI specific path if it exists
+    if os.path.exists("/home/jupyter"):
+        potential_paths.insert(0, os.path.join("/home/jupyter", filename))
+    
+    # Try each path until one works
+    for output_path in potential_paths:
+        try:
+            logger.info(f"Attempting to generate PDF at: {output_path}")
+            
+            # Create the PDF document
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+            
+            # Create styles
+            styles = getSampleStyleSheet()
+            styles.add(ParagraphStyle(
+                name='Justify',
+                fontName='Helvetica',
+                fontSize=10,
+                leading=14,
+                alignment=TA_JUSTIFY
+            ))
+            
+            # Add title style
+            title_style = styles['Heading1']
+            title_style.alignment = TA_LEFT
+            
+            # Create elements for the PDF
+            elements = []
+            
+            # Add title
+            elements.append(Paragraph(f"Query: {query}", title_style))
+            elements.append(Spacer(1, 0.25 * inch))
+            
+            # Process response text (handle markdown formatting)
+            paragraphs = response.split("\n\n")
+            
+            for paragraph in paragraphs:
+                if paragraph.startswith("# "):
+                    # Main heading
+                    heading_text = paragraph[2:].strip()
+                    elements.append(Paragraph(heading_text, styles['Heading1']))
+                    elements.append(Spacer(1, 0.15 * inch))
+                elif paragraph.startswith("## "):
+                    # Subheading
+                    subheading_text = paragraph[3:].strip()
+                    elements.append(Paragraph(subheading_text, styles['Heading2']))
+                    elements.append(Spacer(1, 0.1 * inch))
+                elif paragraph.startswith("- "):
+                    # List item
+                    list_text = paragraph[2:].strip()
+                    elements.append(Paragraph("• " + list_text, styles['Normal']))
+                    elements.append(Spacer(1, 0.05 * inch))
+                else:
+                    # Regular paragraph
+                    elements.append(Paragraph(paragraph, styles['Justify']))
+                    elements.append(Spacer(1, 0.1 * inch))
+            
+            # Add sources section
+            elements.append(Paragraph("Sources", styles['Heading2']))
+            elements.append(Spacer(1, 0.1 * inch))
+            
+            # Create a table of sources
+            sources_data = [["Document", "Excerpt"]]
+            doc_sources = {}
+            
+            # Group chunks by document
+            for chunk in retrieved_chunks:
+                if chunk.doc_id not in doc_sources:
+                    doc_sources[chunk.doc_id] = []
+                if len(chunk.text) > 10:  # Only include non-empty chunks
+                    doc_sources[chunk.doc_id].append(chunk)
+            
+            # Add each source to the table
+            for doc_id, chunks in doc_sources.items():
+                # Add up to 2 excerpts per document
+                for i, chunk in enumerate(chunks[:2]):
+                    # Format excerpt (first 100 chars)
+                    excerpt = chunk.text[:100] + "..." if len(chunk.text) > 100 else chunk.text
+                    row = [doc_id if i == 0 else "", excerpt]
+                    sources_data.append(row)
+            
+            # Create the table
+            if len(sources_data) > 1:  # Only create table if we have sources
+                sources_table = Table(sources_data, colWidths=[1.5*inch, 4*inch])
+                sources_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey)
+                ]))
+                elements.append(sources_table)
+            else:
+                elements.append(Paragraph("No source documents available", styles['Normal']))
+            
+            # Add footer with timestamp
+            elements.append(Spacer(1, 0.5 * inch))
+            footer_text = f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            elements.append(Paragraph(footer_text, styles['Normal']))
+            
+            # Build the PDF
+            doc.build(elements)
+            logger.info(f"Successfully generated PDF at: {output_path}")
+            
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error while generating PDF at {output_path}: {str(e)}")
+            continue  # Try next path
+    
+    # If we get here, all attempts failed
+    error_msg = "Failed to generate PDF after trying multiple locations. Check permissions and disk space."
+    logger.error(error_msg)
+    return error_msg
     
 """
 Enhanced Retrieval-Augmented Generation (RAG) System
@@ -2239,3 +2394,6 @@ def example_usage():
 # Run the system if executed directly
 if __name__ == "__main__":
     main()
+
+
+
