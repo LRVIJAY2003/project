@@ -1,54 +1,47 @@
-# Core and Flask packages
-Flask==2.3.3
-Flask-Cors==4.0.0
-Flask-RESTful==0.3.10
-python-dotenv==1.0.0
-gunicorn==21.2.0
+# Core Flask
+Flask==2.0.3
+Flask-Cors==3.0.10
+Flask-RESTful==0.3.9
+python-dotenv==0.20.0
+gunicorn==20.1.0
 
-# Data processing
-beautifulsoup4==4.12.2
-lxml==4.9.3
+# Data processing - simple versions
+beautifulsoup4==4.11.1
+lxml==4.9.1
 html2text==2020.1.16
-jsonschema==4.19.0
-markdown==3.4.4
+jsonschema==4.15.0
+markdown==3.3.7
 
-# API and HTTP
-requests==2.31.0
-requests-cache==1.1.0
-urllib3==2.0.5
-PyJWT==2.8.0
+# HTTP
+requests==2.28.1
+requests-cache==0.9.7
+urllib3==1.26.12
+PyJWT==2.4.0
 
-# ML and Vector Database - order matters
-numpy==1.26.3
-scipy==1.12.0
-scikit-learn==1.3.2
-pandas==2.1.4
-torch==2.2.0
-transformers==4.30.0
-sentence-transformers==2.2.2
-faiss-cpu==1.7.4
+# ML with binary wheels (no compilation)
+numpy==1.23.4
+scipy==1.9.3
+scikit-learn==1.1.3
+pandas==1.5.1
 
-# Text processing
-spacy==3.7.2
-nltk==3.8.1
+# Text processing (minimal versions)
+nltk==3.7
 rank-bm25==0.2.2
 
-# Google AI and Gemini - critical conflict resolution
-protobuf==3.20.0
-googleapis-common-protos==1.56.4
-google-auth==2.16.0
-google-api-core==2.11.0
-google-api-python-client==2.80.0
-google-cloud-aiplatform==1.25.0
-google-auth-oauthlib==1.0.0
+# Simplified Google packages
+protobuf==3.19.4
+google-api-python-client==2.65.0
+google-auth==2.12.0
+google-auth-oauthlib==0.5.3
 
-# Caching and optimization
-redis==5.0.0
-cachetools==5.3.1
+# Utilities with minimal dependencies
+tqdm==4.64.1
+pydantic==1.10.2
+loguru==0.6.0
+tenacity==8.1.0
 
-# Utilities
-tqdm==4.66.1
-pydantic==2.5.3
-tenacity==8.2.3
-loguru==0.7.2
-python-slugify==8.0.1
+# Pre-built ML packages (optional - install separately if needed)
+# torch
+# transformers
+# sentence-transformers
+# faiss-cpu
