@@ -1,39 +1,37 @@
 #!/usr/bin/env python3
 """
-Enhanced COPPER Knowledge Assistant
+Ultimate COPPER Knowledge Assistant
 -----------------------------------
-Comprehensive solution that loads ALL Confluence content,
-intelligently extracts ALL relevant information including tables and image metadata,
-and uses advanced relevance scoring to provide accurate answers about COPPER.
+A comprehensive, robust solution that extracts ALL information from Confluence pages
+including tables, images, links, and follows references to ensure complete knowledge.
 """
 
-import logging
 import os
 import sys
+import logging
 import json
-import re
 import time
-import concurrent.futures
-from datetime import datetime
-import threading
-import queue
-from collections import defaultdict
-import hashlib
-import pickle
-
-# Confluence imports
 import requests
-from bs4 import BeautifulSoup, NavigableString
-from urllib.parse import urljoin
+import re
+import pickle
+import hashlib
+import base64
+import queue
+from urllib.parse import urljoin, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor
+from bs4 import BeautifulSoup, NavigableString, Tag
+import threading
+from collections import defaultdict
+import tempfile
 
-# Gemini/Vertex AI imports
-from vertexai.generative_models import GenerationConfig, GenerativeModel
+# For Gemini
 import vertexai
+from vertexai.generative_models import GenerationConfig, GenerativeModel
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("copper_assistant.log"),
         logging.StreamHandler(sys.stdout)
@@ -48,816 +46,847 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.0-flash-001")
 CONFLUENCE_URL = os.environ.get("CONFLUENCE_URL", "https://your-confluence-instance.atlassian.net")
 CONFLUENCE_USERNAME = os.environ.get("CONFLUENCE_USERNAME", "")
 CONFLUENCE_API_TOKEN = os.environ.get("CONFLUENCE_API_TOKEN", "")
-CONFLUENCE_SPACE = os.environ.get("CONFLUENCE_SPACE", "xyz")  # Target specific space
+CONFLUENCE_SPACE = os.environ.get("CONFLUENCE_SPACE", "xyz")
 
-# Performance and caching settings
-MAX_WORKERS = 10  # Increased number of parallel workers
+# Cache directories
 CACHE_DIR = "copper_cache"
-RELEVANCE_THRESHOLD = 0.6  # Minimum relevance score to include content (as suggested)
+PAGE_INDEX_FILE = os.path.join(CACHE_DIR, f"{CONFLUENCE_SPACE}_page_index.pickle")
+RAW_CONTENT_DIR = os.path.join(CACHE_DIR, "raw_content")
+PROCESSED_CONTENT_DIR = os.path.join(CACHE_DIR, "processed_content")
+REFERENCED_CONTENT_DIR = os.path.join(CACHE_DIR, "referenced_content")
+IMAGE_CACHE_DIR = os.path.join(CACHE_DIR, "images")
+
+# Create cache directories
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(RAW_CONTENT_DIR, exist_ok=True)
+os.makedirs(PROCESSED_CONTENT_DIR, exist_ok=True)
+os.makedirs(REFERENCED_CONTENT_DIR, exist_ok=True)
+os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
+
+# Set global constants
+MAX_RESULTS = 30
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+MAX_LINK_DEPTH = 2  # How many links deep to follow
+MAX_LINKS_PER_PAGE = 5  # Maximum number of links to follow per page
+TABLE_EXTRACTION_METHODS = 3  # Number of different methods to try for table extraction
 
 
-class AdvancedContentExtractor:
-    """Advanced extraction of content from Confluence HTML, with special focus on tables and images."""
+class ComprehensiveContentExtractor:
+    """Extract ALL content from Confluence pages including tables, images, and links."""
     
     @staticmethod
-    def extract_text_between_tags(soup, tag_name, class_name=None):
-        """Extract text from specific tags with optional class filter."""
-        results = []
-        tags = soup.find_all(tag_name, class_=class_name) if class_name else soup.find_all(tag_name)
-        for tag in tags:
-            text = tag.get_text().strip()
-            if text:
-                results.append(text)
-        return results
+    def extract_title(soup):
+        """Extract the page title."""
+        title_tag = soup.find('title')
+        if title_tag and title_tag.string:
+            return title_tag.string.strip()
+        
+        # Try to find the main heading
+        h1 = soup.find('h1')
+        if h1:
+            return h1.get_text().strip()
+        
+        return "Untitled Page"
     
     @staticmethod
-    def extract_table_with_headers(table_soup):
+    def extract_headings(soup):
+        """Extract all headings with their hierarchy."""
+        headings = []
+        for level in range(1, 7):
+            for heading in soup.find_all(f'h{level}'):
+                headings.append({
+                    "level": level,
+                    "text": heading.get_text().strip(),
+                    "id": heading.get('id', '')
+                })
+        return headings
+    
+    @staticmethod
+    def extract_tables(soup):
         """
-        Extract a table with proper header-to-data relationships.
-        Works with complex table structures including rowspan and colspan.
+        Extract tables using multiple methods to ensure all table data is captured.
+        Returns list of extracted tables with their contents.
         """
-        # Initialize table data structure
-        table_data = {
-            "headers": [],
-            "rows": [],
-            "caption": "",
-            "metadata": {}
-        }
+        all_tables = []
         
-        # Extract caption if available
-        caption = table_soup.find('caption')
-        if caption:
-            table_data["caption"] = caption.get_text().strip()
+        # Method 1: Standard HTML table extraction
+        for table_idx, table in enumerate(soup.find_all('table')):
+            # Get table caption or create a default one
+            caption = ""
+            caption_tag = table.find('caption')
+            if caption_tag:
+                caption = caption_tag.get_text().strip()
+            
+            if not caption:
+                # Try to find a preceding heading as caption
+                prev_heading = table.find_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+                if prev_heading and prev_heading.get_text().strip():
+                    caption = f"Table related to: {prev_heading.get_text().strip()}"
+                else:
+                    caption = f"Table {table_idx + 1}"
+            
+            # Extract headers
+            headers = []
+            thead = table.find('thead')
+            if thead:
+                header_row = thead.find('tr')
+                if header_row:
+                    headers = [th.get_text().strip() for th in header_row.find_all(['th', 'td'])]
+            
+            # If no thead, check if first row looks like a header
+            if not headers:
+                first_row = table.find('tr')
+                if first_row:
+                    # Check if row has th elements or td elements with header styling
+                    if first_row.find('th') or any('header' in td.get('class', '') for td in first_row.find_all('td')):
+                        headers = [cell.get_text().strip() for cell in first_row.find_all(['th', 'td'])]
+            
+            # Extract rows
+            rows = []
+            tbody = table.find('tbody')
+            if tbody:
+                for tr in tbody.find_all('tr'):
+                    row = [td.get_text().strip() for td in tr.find_all(['td', 'th'])]
+                    if any(cell for cell in row):  # Skip empty rows
+                        rows.append(row)
+            else:
+                # If no tbody, get all rows (excluding header if found)
+                all_rows = table.find_all('tr')
+                start_idx = 1 if headers and len(all_rows) > 0 else 0
+                for tr in all_rows[start_idx:]:
+                    row = [td.get_text().strip() for td in tr.find_all(['td', 'th'])]
+                    if any(cell for cell in row):  # Skip empty rows
+                        rows.append(row)
+            
+            # Add table to results
+            all_tables.append({
+                "caption": caption,
+                "headers": headers,
+                "rows": rows,
+                "extraction_method": "html_table"
+            })
         
-        # Extract headers
-        headers = []
-        thead = table_soup.find('thead')
-        if thead:
-            header_rows = thead.find_all('tr')
-            if header_rows:
-                # Process all header rows to handle multi-level headers
-                for row in header_rows:
-                    header_cells = []
-                    for cell in row.find_all(['th', 'td']):
-                        header_cells.append({
-                            "text": cell.get_text().strip(),
-                            "rowspan": int(cell.get('rowspan', 1)),
-                            "colspan": int(cell.get('colspan', 1))
-                        })
-                    if header_cells:
-                        headers.append(header_cells)
+        # Method 2: Confluence table macros extraction
+        for table_macro in soup.find_all('div', class_=lambda c: c and 'table-macro' in c):
+            caption = ""
+            title_div = table_macro.find('div', class_='confluenceTh')
+            if title_div:
+                caption = title_div.get_text().strip()
+            
+            rows = []
+            for tr in table_macro.find_all(['tr', 'div'], class_=lambda c: c and 'confluenceTr' in c):
+                row = []
+                for cell in tr.find_all(['td', 'div'], class_=lambda c: c and ('confluenceTd' in c or 'confluenceTh' in c)):
+                    row.append(cell.get_text().strip())
+                if row:
+                    rows.append(row)
+            
+            # Try to extract headers (first row if it looks different)
+            headers = []
+            if rows and 'confluenceTh' in str(table_macro):
+                headers = rows[0]
+                rows = rows[1:]
+            
+            # Add table to results if not empty
+            if rows:
+                all_tables.append({
+                    "caption": caption,
+                    "headers": headers,
+                    "rows": rows,
+                    "extraction_method": "confluence_macro"
+                })
+        
+        # Method 3: Grid/Layout-based tables
+        for grid_div in soup.find_all('div', class_=lambda c: c and ('grid' in c or 'layout' in c)):
+            # Check if this looks like a table structure
+            cells = grid_div.find_all('div', class_=lambda c: c and 'cell' in c)
+            if len(cells) >= 4:  # At least 4 cells to consider it a table
+                rows = []
+                current_row = []
+                row_idx = -1
                 
-                # For simplicity, flatten multi-level headers
-                if headers:
-                    flattened_headers = []
-                    for row in headers:
-                        for cell in row:
-                            header_text = cell["text"]
-                            if header_text and header_text not in flattened_headers:
-                                flattened_headers.append(header_text)
-                    table_data["headers"] = flattened_headers
-        
-        # If no headers found in thead, look for first row with th elements
-        if not table_data["headers"]:
-            first_row = table_soup.find('tr')
-            if first_row:
-                header_cells = first_row.find_all('th')
-                if header_cells:
-                    table_data["headers"] = [cell.get_text().strip() for cell in header_cells]
-        
-        # If still no headers, check if first row looks like a header
-        if not table_data["headers"]:
-            first_row = table_soup.find('tr')
-            if first_row:
-                # Check if it looks like a header row based on formatting or position
-                cells = first_row.find_all('td')
-                if cells and all(cell.get('style') and ('bold' in cell.get('style') or 'background' in cell.get('style')) for cell in cells):
-                    table_data["headers"] = [cell.get_text().strip() for cell in cells]
-                elif cells and first_row.parent.name != 'tbody':
-                    # First row outside tbody might be a header
-                    table_data["headers"] = [cell.get_text().strip() for cell in cells]
-        
-        # Extract rows
-        rows = []
-        body_rows = []
-        
-        # Check for tbody first
-        tbody = table_soup.find('tbody')
-        if tbody:
-            body_rows = tbody.find_all('tr')
-        else:
-            # If no tbody, get all rows (skipping header row if headers were found)
-            all_rows = table_soup.find_all('tr')
-            skip_first = len(table_data["headers"]) > 0 and len(all_rows) > 0
-            body_rows = all_rows[1:] if skip_first else all_rows
-        
-        # Process each row
-        for row in body_rows:
-            cells = row.find_all(['td', 'th'])
-            if cells:
-                row_data = []
                 for cell in cells:
-                    cell_text = cell.get_text().strip()
-                    # Check for nested tables and extract them separately
-                    nested_tables = cell.find_all('table')
-                    if nested_tables:
-                        nested_data = []
-                        for nested_table in nested_tables:
-                            # Remove the nested table from cell text to avoid duplication
-                            for tag in cell.find_all('table'):
-                                tag.decompose()
-                            # Get the clean cell text
-                            cell_text = cell.get_text().strip()
-                            # Extract the nested table
-                            nested_table_data = AdvancedContentExtractor.extract_table_with_headers(nested_table)
-                            if nested_table_data["rows"]:
-                                nested_data.append(nested_table_data)
+                    # Try to detect row changes based on positioning
+                    cell_style = cell.get('style', '')
+                    if 'clear:' in cell_style or 'clear: ' in cell_style:
+                        if current_row:
+                            rows.append(current_row)
+                            current_row = []
+                    
+                    current_row.append(cell.get_text().strip())
+                    
+                    # End of row detection based on cell count or explicit markup
+                    if len(current_row) >= 3 or 'clear:' in cell_style:
+                        rows.append(current_row)
+                        current_row = []
+                
+                # Add any remaining cells
+                if current_row:
+                    rows.append(current_row)
+                
+                # Normalize row lengths
+                max_cols = max(len(row) for row in rows) if rows else 0
+                for i, row in enumerate(rows):
+                    if len(row) < max_cols:
+                        rows[i] = row + [''] * (max_cols - len(row))
+                
+                # Add to tables if we have legitimate content
+                if rows and max_cols >= 2:
+                    # Try to determine if first row is header
+                    headers = []
+                    if rows:
+                        first_is_header = False
                         
-                        # Combine cell text with nested table info
-                        if nested_data:
-                            cell_info = {
-                                "text": cell_text,
-                                "nested_tables": nested_data,
-                                "rowspan": int(cell.get('rowspan', 1)),
-                                "colspan": int(cell.get('colspan', 1))
-                            }
-                            row_data.append(cell_info)
-                        else:
-                            row_data.append(cell_text)
-                    else:
-                        row_data.append(cell_text)
-                
-                if any(cell for cell in row_data if cell):  # Skip empty rows
-                    rows.append(row_data)
+                        # Check if first row has different formatting
+                        first_row_cells = cells[:max_cols]
+                        other_cells = cells[max_cols:]
+                        
+                        if first_row_cells and other_cells:
+                            first_classes = ''.join(str(cell.get('class', '')) for cell in first_row_cells)
+                            other_classes = ''.join(str(cell.get('class', '')) for cell in other_cells[:max_cols])
+                            
+                            if 'header' in first_classes or 'heading' in first_classes or first_classes != other_classes:
+                                first_is_header = True
+                        
+                        if first_is_header:
+                            headers = rows[0]
+                            rows = rows[1:]
+                    
+                    all_tables.append({
+                        "caption": f"Grid Table",
+                        "headers": headers,
+                        "rows": rows,
+                        "extraction_method": "grid_layout"
+                    })
         
-        table_data["rows"] = rows
-        
-        # Extract any additional metadata about the table
-        table_class = table_soup.get('class', [])
-        table_id = table_soup.get('id', '')
-        if table_class or table_id:
-            table_data["metadata"] = {
-                "class": table_class,
-                "id": table_id
-            }
-        
-        return table_data
+        return all_tables
     
     @staticmethod
-    def format_table_for_context(table_data):
-        """Format extracted table data into a text representation."""
-        lines = []
+    def extract_images(soup, base_url):
+        """
+        Extract all images with their context and descriptions.
+        Returns list of dictionaries with image information.
+        """
+        images = []
         
-        # Add caption/title
-        if table_data["caption"]:
-            lines.append(f"TABLE: {table_data['caption']}")
-        elif table_data["metadata"].get("id"):
-            lines.append(f"TABLE ID: {table_data['metadata']['id']}")
-        else:
-            lines.append(f"TABLE:")
-        
-        # Use headers if available
-        if table_data["headers"]:
-            headers = table_data["headers"]
-            # Calculate column widths
-            col_widths = [len(str(h)) for h in headers]
+        for img in soup.find_all('img'):
+            # Get basic attributes
+            src = img.get('src', '')
+            alt = img.get('alt', '')
+            title = img.get('title', '')
             
-            # Update column widths based on data
-            for row in table_data["rows"]:
-                for i, cell in enumerate(row[:len(col_widths)]):
-                    if i < len(col_widths):
-                        if isinstance(cell, dict):
-                            cell_text = cell["text"]
-                        else:
-                            cell_text = str(cell)
-                        col_widths[i] = max(col_widths[i], min(len(cell_text), 30))  # Limit width to 30 chars
-            
-            # Format header
-            header_row = "| " + " | ".join(str(h).ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
-            separator = "| " + " | ".join("-" * w for w in col_widths) + " |"
-            lines.append(header_row)
-            lines.append(separator)
-            
-            # Format data rows with headers
-            for row in table_data["rows"]:
-                # Prepare row data aligned with headers
-                row_cells = []
-                for i, header in enumerate(headers):
-                    if i < len(row):
-                        if isinstance(row[i], dict):
-                            cell_text = row[i]["text"]
-                        else:
-                            cell_text = str(row[i])
-                        row_cells.append(cell_text.ljust(col_widths[i]))
-                    else:
-                        row_cells.append("".ljust(col_widths[i]))
+            # Skip icons, emojis and tiny images
+            if 'icon' in src.lower() or 'emoji' in src.lower() or 'logo' in src.lower():
+                continue
                 
-                lines.append("| " + " | ".join(row_cells) + " |")
-        
-        else:
-            # Table without headers
-            # Calculate column widths
-            col_count = max(len(row) for row in table_data["rows"]) if table_data["rows"] else 0
-            if col_count == 0:
-                return "TABLE: [Empty table]"
-                
-            col_widths = [0] * col_count
-            for row in table_data["rows"]:
-                for i, cell in enumerate(row[:col_count]):
-                    if isinstance(cell, dict):
-                        cell_text = cell["text"]
-                    else:
-                        cell_text = str(cell)
-                    col_widths[i] = max(col_widths[i], min(len(cell_text), 30))
+            # Try width/height attributes
+            width = img.get('width', '')
+            height = img.get('height', '')
             
-            # Format rows
-            for row in table_data["rows"]:
-                row_cells = []
-                for i in range(col_count):
-                    if i < len(row):
-                        if isinstance(row[i], dict):
-                            cell_text = row[i]["text"]
-                        else:
-                            cell_text = str(row[i])
-                        row_cells.append(cell_text.ljust(col_widths[i]))
-                    else:
-                        row_cells.append("".ljust(col_widths[i]))
-                
-                lines.append("| " + " | ".join(row_cells) + " |")
+            # Skip very small images (likely icons)
+            if (width and int(width.replace('px', '')) < 50) or (height and int(height.replace('px', '')) < 50):
+                continue
+            
+            # Get full image URL
+            if src and not src.startswith(('http://', 'https://')):
+                src = urljoin(base_url, src)
+            
+            # Get context for image
+            context = ComprehensiveContentExtractor._get_image_context(img, soup)
+            
+            # Add to images list
+            images.append({
+                "src": src,
+                "alt": alt or context.get('alt', ''),
+                "title": title or context.get('title', ''),
+                "caption": context.get('caption', ''),
+                "surrounding_text": context.get('surrounding_text', ''),
+                "section": context.get('section', '')
+            })
         
-        return "\n".join(lines)
+        return images
     
     @staticmethod
-    def extract_image_context(img_tag, soup):
-        """
-        Extract comprehensive context for an image, including:
-        - Alt text and title
-        - Figure captions
-        - Surrounding text (preceding and following paragraphs)
-        - Parent section title
-        - Any image metadata
-        """
+    def _get_image_context(img, soup):
+        """Get comprehensive context for an image."""
         context = {
-            "alt": img_tag.get('alt', '').strip(),
-            "title": img_tag.get('title', '').strip(),
-            "src": img_tag.get('src', '').strip(),
-            "caption": "",
-            "surrounding_text": "",
-            "section_title": "",
-            "metadata": {}
+            'alt': img.get('alt', ''),
+            'title': img.get('title', ''),
+            'caption': '',
+            'surrounding_text': '',
+            'section': ''
         }
         
-        # Extract figure caption if image is in a figure
-        parent_fig = img_tag.find_parent('figure')
-        if parent_fig:
-            caption = parent_fig.find('figcaption')
-            if caption:
-                context["caption"] = caption.get_text().strip()
+        # Find caption from figure/figcaption
+        figure = img.find_parent('figure')
+        if figure:
+            figcaption = figure.find('figcaption')
+            if figcaption:
+                context['caption'] = figcaption.get_text().strip()
         
-        # Look for image in other common patterns
-        if not context["caption"]:
-            # Check for adjacent div with caption class
-            next_div = img_tag.find_next_sibling('div')
-            if next_div and next_div.get('class') and any('caption' in cls for cls in next_div.get('class')):
-                context["caption"] = next_div.get_text().strip()
-            
-            # Check for parent div with image+caption pattern
-            parent_div = img_tag.find_parent('div')
-            if parent_div:
-                caption_div = parent_div.find('div', class_=lambda cls: cls and 'caption' in cls)
-                if caption_div:
-                    context["caption"] = caption_div.get_text().strip()
+        # If no figcaption, look for nearby div with caption class
+        if not context['caption']:
+            img_parent = img.parent
+            next_sibling = img_parent.next_sibling
+            if next_sibling and isinstance(next_sibling, Tag):
+                if 'caption' in next_sibling.get('class', []):
+                    context['caption'] = next_sibling.get_text().strip()
         
-        # Get surrounding text
-        prev_text = ""
-        next_text = ""
+        # Find surrounding text
+        surrounding = []
         
-        # Previous paragraph or heading
-        prev_elem = img_tag.find_previous(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div'])
-        if prev_elem and not prev_elem.find('img'):  # Avoid other images
-            prev_text = prev_elem.get_text().strip()
+        # Previous paragraph
+        prev_p = img.find_previous('p')
+        if prev_p:
+            surrounding.append(prev_p.get_text().strip())
         
         # Next paragraph
-        next_elem = img_tag.find_next(['p', 'div'])
-        if next_elem and not next_elem.find('img'):  # Avoid other images
-            next_text = next_elem.get_text().strip()
+        next_p = img.find_next('p')
+        if next_p:
+            surrounding.append(next_p.get_text().strip())
         
-        if prev_text or next_text:
-            context["surrounding_text"] = f"{prev_text}\n{next_text}".strip()
+        context['surrounding_text'] = ' '.join(surrounding)
         
-        # Find section title (nearest preceding heading)
-        section_heading = img_tag.find_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-        if section_heading:
-            context["section_title"] = section_heading.get_text().strip()
-        
-        # Extract any data attributes that might contain metadata
-        for attr, value in img_tag.attrs.items():
-            if attr.startswith('data-'):
-                context["metadata"][attr] = value
+        # Find section/heading
+        section = img.find_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        if section:
+            context['section'] = section.get_text().strip()
         
         return context
     
     @staticmethod
-    def format_image_for_context(image_context):
-        """Format extracted image context into a text representation."""
-        parts = ["[IMAGE]"]
+    def extract_links(soup, base_url):
+        """
+        Extract all relevant links from the page.
+        Returns list of dictionaries with link information.
+        """
+        links = []
         
-        if image_context["alt"]:
-            parts.append(f"Description: {image_context['alt']}")
-        elif image_context["title"]:
-            parts.append(f"Title: {image_context['title']}")
+        for a in soup.find_all('a'):
+            href = a.get('href', '')
+            text = a.get_text().strip()
+            
+            # Skip empty links
+            if not href or not text:
+                continue
+            
+            # Skip anchors
+            if href.startswith('#'):
+                continue
+            
+            # Skip external links (not in the same Confluence instance)
+            parsed_base = urlparse(base_url)
+            parsed_href = urlparse(href)
+            
+            is_internal = False
+            if not parsed_href.netloc:  # Relative URL
+                is_internal = True
+            elif parsed_href.netloc == parsed_base.netloc:  # Same domain
+                is_internal = True
+            
+            # Get full URL
+            full_url = urljoin(base_url, href)
+            
+            # Try to determine if it's a Confluence page link
+            is_confluence_page = False
+            if is_internal:
+                if '/pages/' in href or '/display/' in href or '/spaces/' in href:
+                    is_confluence_page = True
+                
+                # Check for viewpage.action
+                if 'viewpage.action' in href:
+                    is_confluence_page = True
+            
+            # Extract page ID from URL if possible
+            page_id = None
+            if is_confluence_page:
+                # Try to parse page ID from URL
+                if 'pageId=' in href:
+                    page_id = parse_qs(urlparse(href).query).get('pageId', [None])[0]
+            
+            # Get context for link
+            link_context = ""
+            parent_p = a.find_parent('p')
+            if parent_p:
+                link_context = parent_p.get_text().strip()
+            
+            links.append({
+                "url": full_url,
+                "text": text,
+                "is_internal": is_internal,
+                "is_confluence_page": is_confluence_page,
+                "page_id": page_id,
+                "context": link_context
+            })
         
-        if image_context["caption"]:
-            parts.append(f"Caption: {image_context['caption']}")
-        
-        if image_context["section_title"]:
-            parts.append(f"In section: {image_context['section_title']}")
-        
-        if image_context["surrounding_text"]:
-            parts.append(f"Context: {image_context['surrounding_text']}")
-        
-        return "\n".join(parts)
+        return links
     
     @staticmethod
-    def extract_content_from_html(html_content, title=""):
+    def extract_definitions(soup):
         """
-        Extract comprehensive content from HTML including tables, images, and structured content.
+        Extract definitions from the page (especially important for acronyms like COPPER).
+        Returns list of dictionaries with term and definition.
+        """
+        definitions = []
         
-        Args:
-            html_content: The HTML content to process
-            title: The title of the content
+        # Method 1: Formal definition lists
+        for dl in soup.find_all('dl'):
+            for dt in dl.find_all('dt'):
+                dd = dt.find_next('dd')
+                if dd:
+                    definitions.append({
+                        "term": dt.get_text().strip(),
+                        "definition": dd.get_text().strip(),
+                        "type": "definition_list"
+                    })
+        
+        # Method 2: Look for typical definition patterns in text
+        # First pass: Look for "X stands for Y" or "X is an acronym for Y" patterns
+        for p in soup.find_all(['p', 'div']):
+            text = p.get_text().strip()
             
-        Returns:
-            Dict containing processed content elements
+            # Look for "COPPER stands for..." or "COPPER is an acronym for..."
+            for pattern in [
+                r'([A-Z][A-Za-z0-9_-]+)\s+stands\s+for\s+([^\.]+)',
+                r'([A-Z][A-Za-z0-9_-]+)\s+is\s+an\s+acronym\s+for\s+([^\.]+)',
+                r'([A-Z][A-Za-z0-9_-]+)\s+is\s+short\s+for\s+([^\.]+)',
+                r'full\s+form\s+of\s+([A-Z][A-Za-z0-9_-]+)\s+is\s+([^\.]+)',
+                r'term\s+([A-Z][A-Za-z0-9_-]+)\s+refers\s+to\s+([^\.]+)'
+            ]:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                for match in matches:
+                    if len(match) == 2:
+                        term, definition = match
+                        # Skip if term is too common
+                        if term.lower() not in ['a', 'an', 'the', 'is', 'are', 'were', 'was']:
+                            definitions.append({
+                                "term": term.strip(),
+                                "definition": definition.strip(),
+                                "type": "pattern_match",
+                                "context": text
+                            })
+        
+        # Method 3: Look for formatting patterns (e.g., bold term followed by definition)
+        for bold in soup.find_all(['b', 'strong']):
+            term = bold.get_text().strip()
+            
+            # Skip common formatting
+            if term.lower() in ['note', 'warning', 'important', 'example']:
+                continue
+                
+            # Skip if too short or too long
+            if len(term) < 2 or len(term) > 50:
+                continue
+            
+            # Get parent paragraph
+            parent = bold.find_parent(['p', 'li', 'div'])
+            if parent:
+                full_text = parent.get_text().strip()
+                
+                # Get text after the bold term
+                term_index = full_text.find(term)
+                if term_index >= 0:
+                    after_term = full_text[term_index + len(term):].strip()
+                    
+                    # Check for typical definition separators
+                    for separator in [':', '-', '–', '—', '=']:
+                        if separator in after_term[:10]:
+                            definition = after_term.split(separator, 1)[1].strip()
+                            if definition and len(definition) > 5:
+                                definitions.append({
+                                    "term": term,
+                                    "definition": definition,
+                                    "type": "formatting_pattern",
+                                    "context": full_text
+                                })
+                                break
+        
+        # Method 4: Tables that look like term-definition pairs
+        for table in soup.find_all('table'):
+            rows = table.find_all('tr')
+            
+            # Skip tables with too many columns (unlikely to be definition tables)
+            first_row = rows[0] if rows else None
+            if not first_row:
+                continue
+                
+            cells = first_row.find_all(['td', 'th'])
+            if len(cells) != 2:
+                continue
+            
+            # Check if this looks like a term-definition table
+            header_cells = first_row.find_all('th')
+            header_text = [cell.get_text().strip().lower() for cell in header_cells]
+            
+            is_definition_table = False
+            if len(header_text) == 2:
+                first_col, second_col = header_text
+                if any(term in first_col for term in ['term', 'name', 'acronym', 'abbreviation']):
+                    if any(term in second_col for term in ['definition', 'description', 'meaning']):
+                        is_definition_table = True
+            
+            if is_definition_table or len(rows) > 1:  # Either detected or has multiple rows
+                for row in rows[1:] if is_definition_table else rows:
+                    cells = row.find_all(['td', 'th'])
+                    if len(cells) == 2:
+                        term = cells[0].get_text().strip()
+                        definition = cells[1].get_text().strip()
+                        
+                        if term and definition and len(term) <= 50:
+                            definitions.append({
+                                "term": term,
+                                "definition": definition,
+                                "type": "table_definition",
+                                "table_caption": table.find('caption').get_text().strip() if table.find('caption') else ""
+                            })
+        
+        return definitions
+    
+    @staticmethod
+    def extract_structured_sections(soup):
+        """
+        Extract structured content like notes, warnings, info panels.
+        Returns list of dictionaries with type and content.
+        """
+        sections = []
+        
+        # Method 1: Standard Confluence macros
+        for div in soup.find_all('div', class_=lambda c: c and any(macro in c for macro in ['panel', 'note', 'warning', 'info', 'tip', 'aui-message'])):
+            section_type = 'note'
+            for cls in div.get('class', []):
+                if cls in ['note', 'warning', 'info', 'tip', 'error', 'success']:
+                    section_type = cls
+                    break
+            
+            # Get title if available
+            title = ""
+            title_elem = div.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b', '.aui-message-heading'])
+            if title_elem:
+                title = title_elem.get_text().strip()
+                
+                # Remove title element to avoid duplication
+                title_elem.extract()
+            
+            # Get content
+            content = div.get_text().strip()
+            
+            sections.append({
+                "type": section_type.upper(),
+                "title": title,
+                "content": content
+            })
+        
+        # Method 2: Other formatted sections
+        for div in soup.find_all('div'):
+            # Look for divs with inline styling that might indicate special sections
+            style = div.get('style', '')
+            
+            if style and ('background' in style or 'border' in style):
+                # This might be a formatted section
+                
+                # Get title if available
+                title = ""
+                title_elem = div.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b'])
+                if title_elem:
+                    title = title_elem.get_text().strip()
+                
+                # Get content
+                content = div.get_text().strip()
+                
+                if title and content and title != content:
+                    sections.append({
+                        "type": "FORMATTED_SECTION",
+                        "title": title,
+                        "content": content,
+                        "style": style
+                    })
+        
+        return sections
+    
+    @staticmethod
+    def extract_code_blocks(soup):
+        """
+        Extract code blocks from the page.
+        Returns list of dictionaries with code content and language.
+        """
+        code_blocks = []
+        
+        # Method 1: Standard code blocks
+        for pre in soup.find_all('pre'):
+            code = pre.find('code')
+            if code:
+                # Try to determine language
+                language = ""
+                if code.get('class'):
+                    for cls in code.get('class'):
+                        if cls.startswith('language-'):
+                            language = cls.replace('language-', '')
+                            break
+                
+                code_blocks.append({
+                    "language": language,
+                    "content": code.get_text()
+                })
+            else:
+                # Pre without code tag
+                code_blocks.append({
+                    "language": "",
+                    "content": pre.get_text()
+                })
+        
+        # Method 2: Confluence code macros
+        for div in soup.find_all('div', class_=lambda c: c and 'code-block' in c):
+            # Try to determine language
+            language = ""
+            if div.get('class'):
+                for cls in div.get('class'):
+                    if cls.startswith('language-'):
+                        language = cls.replace('language-', '')
+                        break
+            
+            code_blocks.append({
+                "language": language,
+                "content": div.get_text(),
+                "type": "confluence_macro"
+            })
+        
+        return code_blocks
+    
+    @staticmethod
+    def extract_all(html_content, base_url):
+        """
+        Extract all content from HTML.
+        Returns comprehensive structured representation of the page content.
         """
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Structure to hold all extracted content
+            # Remove script and style elements
+            for tag in soup(['script', 'style']):
+                tag.decompose()
+            
+            # Extract all content types
             extracted = {
-                "title": title,
-                "headings": [],
-                "paragraphs": [],
-                "tables": [],
-                "images": [],
-                "code_blocks": [],
-                "lists": [],
-                "structured_content": [],
-                "definitions": [],  # For definition lists and terms
-                "raw_text": ""
+                "title": ComprehensiveContentExtractor.extract_title(soup),
+                "headings": ComprehensiveContentExtractor.extract_headings(soup),
+                "tables": ComprehensiveContentExtractor.extract_tables(soup),
+                "images": ComprehensiveContentExtractor.extract_images(soup, base_url),
+                "links": ComprehensiveContentExtractor.extract_links(soup, base_url),
+                "definitions": ComprehensiveContentExtractor.extract_definitions(soup),
+                "structured_sections": ComprehensiveContentExtractor.extract_structured_sections(soup),
+                "code_blocks": ComprehensiveContentExtractor.extract_code_blocks(soup),
+                "raw_text": soup.get_text().strip()
             }
             
-            # Extract all headings with their hierarchy and content
-            for heading_level in range(1, 7):
-                heading_tag = f'h{heading_level}'
-                for heading in soup.find_all(heading_tag):
-                    heading_text = heading.get_text().strip()
-                    if heading_text:
-                        extracted["headings"].append({
-                            "level": heading_level,
-                            "text": heading_text
-                        })
-            
-            # Extract paragraphs
-            for p in soup.find_all('p'):
-                # Skip empty paragraphs
-                if not p.get_text().strip():
-                    continue
-                
-                # Skip paragraphs that are part of other structures (like figure captions)
-                if p.parent.name in ['figure', 'figcaption']:
-                    continue
-                
-                # Get associated heading if possible
-                closest_heading = {
-                    "text": "",
-                    "level": 0
-                }
-                
-                heading = p.find_previous(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                if heading:
-                    closest_heading = {
-                        "level": int(heading.name[1]),
-                        "text": heading.get_text().strip()
-                    }
-                
-                extracted["paragraphs"].append({
-                    "text": p.get_text().strip(),
-                    "heading": closest_heading
-                })
-            
-            # Extract tables with comprehensive processing
-            for table in soup.find_all('table'):
-                table_data = AdvancedContentExtractor.extract_table_with_headers(table)
-                if table_data["rows"]:  # Only include non-empty tables
-                    extracted["tables"].append(table_data)
-            
-            # Extract images with surrounding context
-            for img in soup.find_all('img'):
-                image_context = AdvancedContentExtractor.extract_image_context(img, soup)
-                if image_context["alt"] or image_context["caption"] or image_context["surrounding_text"]:
-                    extracted["images"].append(image_context)
-            
-            # Extract code blocks
-            for pre in soup.find_all('pre'):
-                code = pre.find('code')
-                if code:
-                    # Check for language specification
-                    code_class = code.get('class', [])
-                    language = ""
-                    for cls in code_class:
-                        if cls.startswith('language-'):
-                            language = cls.replace('language-', '')
-                            break
-                    
-                    # Get the code content
-                    code_content = code.get_text().strip()
-                    extracted["code_blocks"].append({
-                        "language": language,
-                        "content": code_content
-                    })
-                else:
-                    # Pre without code tag
-                    extracted["code_blocks"].append({
-                        "language": "",
-                        "content": pre.get_text().strip()
-                    })
-            
-            # Extract lists (ordered and unordered)
-            for list_tag in soup.find_all(['ul', 'ol']):
-                list_items = []
-                for li in list_tag.find_all('li', recursive=False):
-                    # Skip empty list items
-                    if not li.get_text().strip():
-                        continue
-                    
-                    # Check for nested lists
-                    nested_lists = li.find_all(['ul', 'ol'], recursive=False)
-                    if nested_lists:
-                        # Handle nested list items
-                        nested_items = []
-                        for nested_list in nested_lists:
-                            for nested_li in nested_list.find_all('li'):
-                                nested_text = nested_li.get_text().strip()
-                                if nested_text:
-                                    nested_items.append(nested_text)
-                        
-                        list_items.append({
-                            "text": li.get_text().strip(),
-                            "nested_items": nested_items
-                        })
-                    else:
-                        list_items.append({
-                            "text": li.get_text().strip()
-                        })
-                
-                if list_items:
-                    extracted["lists"].append({
-                        "type": list_tag.name,  # "ul" or "ol"
-                        "items": list_items
-                    })
-            
-            # Extract definition lists
-            for dl in soup.find_all('dl'):
-                definitions = []
-                
-                # Group dt and dd elements
-                current_term = None
-                
-                for child in dl.children:
-                    if child.name == 'dt':
-                        if current_term and current_term["definition"]:
-                            definitions.append(current_term)
-                        current_term = {
-                            "term": child.get_text().strip(),
-                            "definition": ""
-                        }
-                    elif child.name == 'dd' and current_term:
-                        current_term["definition"] = child.get_text().strip()
-                
-                # Add the last term
-                if current_term and current_term["definition"]:
-                    definitions.append(current_term)
-                
-                if definitions:
-                    extracted["definitions"].extend(definitions)
-            
-            # Extract panel content (notes, warnings, info boxes)
-            for div in soup.find_all(['div', 'section']):
-                if not div.get('class'):
-                    continue
-                
-                class_str = ' '.join(div.get('class', []))
-                
-                # Look for common panel and message classes
-                if any(term in class_str.lower() for term in ['panel', 'note', 'warning', 'info', 'error', 'success', 'aui-message']):
-                    # Get panel title if available
-                    title_elem = div.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b', '.aui-message-heading'])
-                    panel_title = title_elem.get_text().strip() if title_elem else ""
-                    
-                    # Determine panel type from class
-                    panel_type = ""
-                    for type_name in ['note', 'info', 'warning', 'error', 'success', 'tip']:
-                        if type_name in class_str.lower():
-                            panel_type = type_name
-                            break
-                    
-                    if not panel_type:
-                        panel_type = "panel"
-                    
-                    # Get panel content
-                    # Remove the title element to avoid duplication
-                    if title_elem:
-                        title_elem.extract()
-                    
-                    panel_content = div.get_text().strip()
-                    
-                    if panel_content:
-                        extracted["structured_content"].append({
-                            "type": panel_type.upper(),
-                            "title": panel_title,
-                            "content": panel_content
-                        })
-            
-            # Extract raw text for general search and context
-            extracted["raw_text"] = soup.get_text().strip()
-            
             return extracted
-        
         except Exception as e:
             logger.error(f"Error extracting content: {str(e)}")
-            # Return minimal structure with error message
             return {
-                "title": title,
+                "title": "Error",
                 "headings": [],
-                "paragraphs": [],
                 "tables": [],
                 "images": [],
-                "code_blocks": [],
-                "lists": [],
-                "structured_content": [],
+                "links": [],
                 "definitions": [],
+                "structured_sections": [],
+                "code_blocks": [],
                 "raw_text": f"Error extracting content: {str(e)}"
             }
     
     @staticmethod
-    def format_for_context(extracted_content, include_all=False):
-        """
-        Format extracted content into a well-structured text representation.
+    def format_table_for_text(table):
+        """Format a table as text for inclusion in context."""
+        lines = []
         
-        Args:
-            extracted_content: The dictionary of extracted content elements
-            include_all: Whether to include all content or a summary
-            
-        Returns:
-            Formatted string with all content elements
-        """
-        sections = []
-        
-        # Add title
-        if extracted_content["title"]:
-            sections.append(f"# {extracted_content['title']}")
-        
-        # Create a structured document with headings
-        current_section = ""
-        current_heading = {"level": 0, "text": ""}
-        
-        # Sort headings by their position in the document to maintain structure
-        all_headings = extracted_content["headings"].copy()
-        
-        # Add paragraphs with their headings
-        for paragraph in extracted_content["paragraphs"]:
-            heading = paragraph["heading"]
-            
-            # If we've moved to a new heading section, add the previous section
-            if heading != current_heading and current_section:
-                sections.append(current_section)
-                current_section = ""
-            
-            # Update current heading if needed
-            if heading != current_heading:
-                current_heading = heading
-                if heading["text"]:
-                    current_section = f"{'#' * (heading['level'] + 1)} {heading['text']}\n\n"
-            
-            # Add paragraph text to the current section
-            current_section += paragraph["text"] + "\n\n"
-        
-        # Add the last section if it exists
-        if current_section:
-            sections.append(current_section)
-        
-        # Add tables with proper formatting
-        if extracted_content["tables"]:
-            for table_data in extracted_content["tables"]:
-                formatted_table = AdvancedContentExtractor.format_table_for_context(table_data)
-                sections.append(f"\n{formatted_table}\n")
-        
-        # Add lists
-        for list_data in extracted_content["lists"]:
-            list_type = list_data["type"]
-            list_text = []
-            
-            for i, item in enumerate(list_data["items"], 1):
-                if list_type == "ol":
-                    prefix = f"{i}. "
-                else:
-                    prefix = "• "
-                
-                if "nested_items" in item:
-                    list_text.append(f"{prefix}{item['text']}")
-                    for nested in item["nested_items"]:
-                        list_text.append(f"  - {nested}")
-                else:
-                    list_text.append(f"{prefix}{item['text']}")
-            
-            if list_text:
-                sections.append("\n".join(list_text))
-        
-        # Add definitions
-        if extracted_content["definitions"]:
-            definitions_text = []
-            for definition in extracted_content["definitions"]:
-                definitions_text.append(f"{definition['term']}: {definition['definition']}")
-            
-            if definitions_text:
-                sections.append("Definitions:\n" + "\n".join(definitions_text))
-        
-        # Add code blocks
-        for code_block in extracted_content["code_blocks"]:
-            language = code_block["language"]
-            content = code_block["content"]
-            
-            if language:
-                sections.append(f"```{language}\n{content}\n```")
-            else:
-                sections.append(f"```\n{content}\n```")
-        
-        # Add image information
-        for image in extracted_content["images"]:
-            image_text = AdvancedContentExtractor.format_image_for_context(image)
-            sections.append(image_text)
-        
-        # Add structured content (panels, notes, etc.)
-        for content in extracted_content["structured_content"]:
-            formatted = f"[{content['type']}]"
-            if content["title"]:
-                formatted += f" {content['title']}"
-            formatted += f"\n{content['content']}"
-            sections.append(formatted)
-        
-        return "\n\n".join(sections)
-
-
-class PersistentCache:
-    """Thread-safe persistent cache for storing API responses and extracted content."""
-    
-    def __init__(self, cache_dir=CACHE_DIR):
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-        self.lock = threading.Lock()
-        
-        # Create subdirectories for different cache types
-        self.api_cache_dir = os.path.join(cache_dir, "api_responses")
-        self.content_cache_dir = os.path.join(cache_dir, "page_content")
-        self.metadata_cache_dir = os.path.join(cache_dir, "metadata")
-        
-        os.makedirs(self.api_cache_dir, exist_ok=True)
-        os.makedirs(self.content_cache_dir, exist_ok=True)
-        os.makedirs(self.metadata_cache_dir, exist_ok=True)
-        
-        # In-memory cache for frequently used items
-        self.memory_cache = {}
-        self.memory_cache_size = 100
-    
-    def _get_cache_key(self, key_components):
-        """Generate a stable cache key from components."""
-        if isinstance(key_components, str):
-            key_str = key_components
+        # Add caption
+        if table["caption"]:
+            lines.append(f"TABLE: {table['caption']}")
         else:
-            key_str = json.dumps(key_components, sort_keys=True)
+            lines.append("TABLE:")
         
-        # Generate a hash of the key for filenames
-        return hashlib.md5(key_str.encode()).hexdigest()
-    
-    def _get_cache_path(self, key, cache_type="api"):
-        """Get the file path for a cache item."""
-        cache_dir = self.api_cache_dir
-        if cache_type == "content":
-            cache_dir = self.content_cache_dir
-        elif cache_type == "metadata":
-            cache_dir = self.metadata_cache_dir
+        # Get column widths for alignment
+        col_widths = []
         
-        return os.path.join(cache_dir, f"{key}.pickle")
-    
-    def get(self, key, cache_type="api"):
-        """
-        Get a value from the cache.
+        # Check headers
+        if table["headers"]:
+            col_widths = [len(str(h)) for h in table["headers"]]
         
-        Args:
-            key: The cache key (string or serializable object)
-            cache_type: Type of cache ("api", "content", or "metadata")
+        # Update widths based on data
+        for row in table["rows"]:
+            for i, cell in enumerate(row):
+                if i >= len(col_widths):
+                    col_widths.append(0)
+                col_widths[i] = max(col_widths[i], min(len(str(cell)), a30))  # Cap width at 30
+        
+        # Format with headers if available
+        if table["headers"]:
+            # Ensure all col_widths are initialized
+            while len(col_widths) < len(table["headers"]):
+                col_widths.append(0)
             
-        Returns:
-            The cached value or None if not found
-        """
-        cache_key = self._get_cache_key(key)
+            # Format header row
+            header_cells = []
+            for i, header in enumerate(table["headers"]):
+                header_cells.append(str(header).ljust(col_widths[i]))
+            
+            lines.append("| " + " | ".join(header_cells) + " |")
+            lines.append("| " + " | ".join("-" * w for w in col_widths) + " |")
         
-        # Check memory cache first
-        memory_key = f"{cache_type}:{cache_key}"
-        with self.lock:
-            if memory_key in self.memory_cache:
-                return self.memory_cache[memory_key]
+        # Format data rows
+        for row in table["rows"]:
+            row_cells = []
+            for i, cell in enumerate(row):
+                if i < len(col_widths):
+                    row_cells.append(str(cell).ljust(col_widths[i]))
+                else:
+                    row_cells.append(str(cell))
+            
+            lines.append("| " + " | ".join(row_cells) + " |")
         
-        # Check file cache
-        cache_path = self._get_cache_path(cache_key, cache_type)
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, "rb") as f:
-                    data = pickle.load(f)
-                
-                # Add to memory cache
-                with self.lock:
-                    if len(self.memory_cache) >= self.memory_cache_size:
-                        # Remove a random item if full
-                        self.memory_cache.pop(next(iter(self.memory_cache)))
-                    self.memory_cache[memory_key] = data
-                
-                return data
-            except Exception as e:
-                logger.error(f"Error reading from cache: {str(e)}")
-        
-        return None
+        return "\n".join(lines)
     
-    def set(self, key, value, cache_type="api"):
-        """
-        Store a value in the cache.
+    @staticmethod
+    def format_for_context(extracted):
+        """Format all extracted content into text for the context."""
+        parts = []
         
-        Args:
-            key: The cache key (string or serializable object)
-            value: The value to cache
-            cache_type: Type of cache ("api", "content", or "metadata")
-        """
-        cache_key = self._get_cache_key(key)
+        # Title
+        if extracted["title"]:
+            parts.append(f"# {extracted['title']}")
         
-        # Add to memory cache
-        memory_key = f"{cache_type}:{cache_key}"
-        with self.lock:
-            if len(self.memory_cache) >= self.memory_cache_size:
-                # Remove a random item if full
-                self.memory_cache.pop(next(iter(self.memory_cache)))
-            self.memory_cache[memory_key] = value
+        # Definitions (especially important for acronyms like COPPER)
+        if extracted["definitions"]:
+            definitions_part = ["## Definitions"]
+            for definition in extracted["definitions"]:
+                definitions_part.append(f"{definition['term']}: {definition['definition']}")
+            
+            parts.append("\n".join(definitions_part))
         
-        # Save to file cache
-        cache_path = self._get_cache_path(cache_key, cache_type)
-        try:
-            with open(cache_path, "wb") as f:
-                pickle.dump(value, f)
-        except Exception as e:
-            logger.error(f"Error writing to cache: {str(e)}")
-    
-    def clear(self, cache_type=None):
-        """
-        Clear the cache.
+        # Headings and content
+        content_by_section = defaultdict(list)
         
-        Args:
-            cache_type: Type of cache to clear or None for all
-        """
-        with self.lock:
-            # Clear memory cache
-            if cache_type:
-                keys_to_remove = [k for k in self.memory_cache if k.startswith(f"{cache_type}:")]
-                for k in keys_to_remove:
-                    self.memory_cache.pop(k, None)
-            else:
-                self.memory_cache.clear()
+        # Organize content by sections
         
-        # Clear file cache
-        if cache_type == "api" or cache_type is None:
-            for f in os.listdir(self.api_cache_dir):
-                os.remove(os.path.join(self.api_cache_dir, f))
+        # Tables
+        for table in extracted["tables"]:
+            # Try to find closest heading
+            section = "General"
+            for heading in extracted["headings"]:
+                if table["caption"] and heading["text"] in table["caption"]:
+                    section = heading["text"]
+                    break
+            
+            content_by_section[section].append({
+                "type": "table",
+                "content": ComprehensiveContentExtractor.format_table_for_text(table)
+            })
         
-        if cache_type == "content" or cache_type is None:
-            for f in os.listdir(self.content_cache_dir):
-                os.remove(os.path.join(self.content_cache_dir, f))
+        # Images
+        for image in extracted["images"]:
+            section = image["section"] or "General"
+            
+            image_text = ["IMAGE:"]
+            if image["alt"]:
+                image_text.append(f"Alt text: {image['alt']}")
+            if image["caption"]:
+                image_text.append(f"Caption: {image['caption']}")
+            if image["surrounding_text"]:
+                image_text.append(f"Context: {image['surrounding_text']}")
+            
+            content_by_section[section].append({
+                "type": "image",
+                "content": "\n".join(image_text)
+            })
         
-        if cache_type == "metadata" or cache_type is None:
-            for f in os.listdir(self.metadata_cache_dir):
-                os.remove(os.path.join(self.metadata_cache_dir, f))
+        # Structured sections
+        for section in extracted["structured_sections"]:
+            heading = section["title"] or "General"
+            
+            section_text = [f"[{section['type']}]"]
+            if section["title"]:
+                section_text.append(f"Title: {section['title']}")
+            section_text.append(section["content"])
+            
+            content_by_section[heading].append({
+                "type": "structured_section",
+                "content": "\n".join(section_text)
+            })
+        
+        # Code blocks
+        for code_block in extracted["code_blocks"]:
+            lang = f"{code_block['language']}" if code_block["language"] else ""
+            
+            content_by_section["Code Examples"].append({
+                "type": "code",
+                "content": f"```{lang}\n{code_block['content']}\n```"
+            })
+        
+        # Add raw text paragraphs
+        paragraphs = re.split(r'\n{2,}', extracted["raw_text"])
+        
+        current_section = "General"
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            
+            # Check if this is a heading
+            is_heading = False
+            for heading in extracted["headings"]:
+                if heading["text"] == paragraph:
+                    current_section = heading["text"]
+                    is_heading = True
+                    break
+            
+            if not is_heading:
+                # Skip paragraphs that are already covered in tables, images, etc.
+                skip = False
+                for content_list in content_by_section.values():
+                    for content_item in content_list:
+                        if paragraph in content_item["content"]:
+                            skip = True
+                            break
+                    if skip:
+                        break
+                
+                if not skip:
+                    content_by_section[current_section].append({
+                        "type": "text",
+                        "content": paragraph
+                    })
+        
+        # Format by section
+        for heading, contents in content_by_section.items():
+            # Skip sections with no content
+            if not contents:
+                continue
+            
+            section_part = [f"## {heading}"]
+            
+            for content_item in contents:
+                section_part.append(content_item["content"])
+            
+            parts.append("\n\n".join(section_part))
+        
+        # Add relevant links
+        if extracted["links"]:
+            links_part = ["## Related Pages"]
+            for link in extracted["links"]:
+                if link["is_confluence_page"]:
+                    links_part.append(f"* [{link['text']}]({link['url']})")
+            
+            if len(links_part) > 1:  # Only add if we have links
+                parts.append("\n".join(links_part))
+        
+        return "\n\n".join(parts)
 
 
-class ConfluenceClient:
-    """Enhanced client for Confluence REST API with comprehensive error handling and improved caching."""
+class EnhancedConfluenceClient:
+    """Enhanced client for interacting with Confluence API."""
     
     def __init__(self, base_url, username, api_token):
-        """
-        Initialize the Confluence client with authentication details.
-        
-        Args:
-            base_url: The base URL of the Confluence instance
-            username: The username for authentication
-            api_token: The API token for authentication
-        """
+        """Initialize the client."""
         self.base_url = base_url.rstrip('/')
         self.auth = (username, api_token)
         self.api_url = f"{self.base_url}/rest/api"
@@ -869,984 +898,812 @@ class ConfluenceClient:
         self.session = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update(self.headers)
-        self.session.verify = False  # As requested: verify=False for SSL
+        self.session.verify = False  # SSL verification disabled as requested
         
-        # Set up requests with retries
-        retry_adapter = requests.adapters.HTTPAdapter(
-            max_retries=3,
-            pool_connections=10,
-            pool_maxsize=10
-        )
-        self.session.mount('http://', retry_adapter)
-        self.session.mount('https://', retry_adapter)
+        # Thread safety
+        self.lock = threading.Lock()
         
-        # Initialize cache
-        self.cache = PersistentCache()
-        
-        # Default timeout (increased for large page downloads)
-        self.timeout = 60
-        
-        logger.info(f"Initialized enhanced Confluence client for {self.base_url}")
+        # For following links
+        self.processed_links = set()
     
-    def test_connection(self):
-        """Test the connection to Confluence API."""
-        try:
-            logger.info("Testing connection to Confluence...")
-            
-            # Try to get space info first (faster than content)
-            response = self.session.get(
-                f"{self.api_url}/space",
-                params={"limit": 1},
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            
-            if response.status_code == 200:
-                logger.info("Connection to Confluence successful!")
-                return True
-            else:
-                logger.warning(f"Unexpected status code during connection test: {response.status_code}")
-                return False
-                
-        except requests.RequestException as e:
-            logger.error(f"Connection test failed: {str(e)}")
-            return False
-    
-    def _make_api_request(self, url, method="GET", params=None, data=None, use_cache=True):
-        """
-        Make an API request with automatic caching.
+    def _make_request(self, url, method="GET", params=None, data=None, retries=MAX_RETRIES):
+        """Make an API request with retries and caching."""
+        # Generate cache key
+        cache_key = f"{method}_{url}_{json.dumps(params) if params else ''}_{json.dumps(data) if data else ''}"
+        cache_key = hashlib.md5(cache_key.encode()).hexdigest()
+        cache_path = os.path.join(RAW_CONTENT_DIR, f"api_{cache_key}.json")
         
-        Args:
-            url: The API URL
-            method: HTTP method (GET, POST, etc.)
-            params: Query parameters
-            data: POST data
-            use_cache: Whether to use cache for GET requests
-            
-        Returns:
-            The JSON response or None on error
-        """
-        # Only cache GET requests
-        use_cache = use_cache and method.upper() == "GET"
-        
-        if use_cache:
-            # Generate a cache key from the request details
-            cache_key = {
-                "url": url,
-                "params": params or {}
-            }
-            
-            # Check cache first
-            cached_response = self.cache.get(cache_key, "api")
-            if cached_response:
-                return cached_response
+        # Check cache for GET requests
+        if method.upper() == "GET" and os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read from cache: {str(e)}")
         
         # Make the request
-        try:
-            method_func = getattr(self.session, method.lower())
-            
-            response = method_func(
-                url,
-                params=params,
-                json=data,
-                timeout=self.timeout
-            )
-            response.raise_for_status()
-            
-            # Parse and cache response for GET requests
-            if response.text.strip():
-                response_data = response.json()
+        for attempt in range(retries + 1):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=data,
+                    timeout=REQUEST_TIMEOUT
+                )
+                response.raise_for_status()
                 
-                if use_cache:
-                    self.cache.set(cache_key, response_data, "api")
+                if not response.text.strip():
+                    return {}
                 
-                return response_data
-            
-            return None
-            
-        except requests.RequestException as e:
-            logger.error(f"API request failed for {url}: {str(e)}")
-            # Log response content if available
-            if hasattr(e, 'response') and e.response:
-                logger.error(f"Status code: {e.response.status_code}")
-                try:
-                    logger.error(f"Response: {e.response.text[:1000]}")
-                except:
-                    pass
-            return None
+                result = response.json()
+                
+                # Cache GET responses
+                if method.upper() == "GET":
+                    try:
+                        with open(cache_path, 'w') as f:
+                            json.dump(result, f)
+                    except Exception as e:
+                        logger.warning(f"Failed to write to cache: {str(e)}")
+                
+                return result
+            except requests.RequestException as e:
+                logger.warning(f"Request failed (attempt {attempt + 1}/{retries + 1}): {str(e)}")
+                if attempt < retries:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    logger.error(f"Request failed after {retries + 1} attempts: {url}")
+                    return None
     
-    def get_space_info(self, space_key):
-        """
-        Get information about a specific Confluence space.
-        
-        Args:
-            space_key: The space key to get information for
-            
-        Returns:
-            Space information or None if not found
-        """
-        url = f"{self.api_url}/space/{space_key}"
-        
-        # Include homepage and metadata in expansion
-        params = {
-            "expand": "homepage,description.view,metadata"
-        }
-        
-        return self._make_api_request(url, params=params)
+    def test_connection(self):
+        """Test the connection to Confluence."""
+        logger.info("Testing connection to Confluence...")
+        response = self._make_request(f"{self.api_url}/space", params={"limit": 1})
+        return response is not None
     
-    def get_all_pages_in_space(self, space_key, include_archived=False, batch_size=100):
-        """
-        Get ALL pages in a Confluence space using efficient pagination.
+    def get_all_pages_in_space(self, space_key):
+        """Get all pages in a space."""
+        logger.info(f"Getting all pages in space: {space_key}")
         
-        Args:
-            space_key: The space key to get all pages from
-            include_archived: Whether to include archived pages
-            batch_size: Number of results per request (max 100)
-            
-        Returns:
-            List of page objects with basic information
-        """
+        # Check for cached page index
+        if os.path.exists(PAGE_INDEX_FILE):
+            try:
+                with open(PAGE_INDEX_FILE, 'rb') as f:
+                    pages = pickle.load(f)
+                    logger.info(f"Loaded {len(pages)} pages from cache")
+                    return pages
+            except Exception as e:
+                logger.warning(f"Failed to load page index from cache: {str(e)}")
+        
         all_pages = []
         start = 0
-        has_more = True
+        limit = 100  # Max allowed by Confluence
         
-        logger.info(f"Fetching all pages from space: {space_key}")
-        
-        # Check if we have a cached result first
-        cache_key = f"all_pages_{space_key}_{include_archived}"
-        cached_pages = self.cache.get(cache_key, "metadata")
-        if cached_pages:
-            logger.info(f"Using {len(cached_pages)} cached pages for space {space_key}")
-            return cached_pages
-        
-        # If not in cache, fetch all pages
-        while has_more:
-            logger.info(f"Fetching pages batch from start={start}")
+        while True:
+            logger.info(f"Fetching pages: start={start}, limit={limit}")
             
-            params = {
-                "spaceKey": space_key,
-                "expand": "history.lastUpdated,metadata.labels",
-                "status": "current" if not include_archived else "any",
-                "limit": batch_size,
-                "start": start
-            }
-            
-            response_data = self._make_api_request(
-                f"{self.api_url}/content", 
-                params=params
+            response = self._make_request(
+                f"{self.api_url}/content",
+                params={
+                    "spaceKey": space_key,
+                    "limit": limit,
+                    "start": start,
+                    "expand": "metadata.labels,history.lastUpdated",
+                    "status": "current"
+                }
             )
             
-            if not response_data:
-                logger.warning(f"Failed to get response for pages at start={start}")
+            if not response or not response.get("results"):
                 break
             
-            results = response_data.get("results", [])
+            results = response["results"]
             all_pages.extend(results)
             
-            # Check if there are more pages
-            if "size" in response_data and "limit" in response_data:
-                if response_data["size"] < response_data["limit"]:
-                    has_more = False
-                else:
-                    start += batch_size
-            else:
-                has_more = False
-            
-            logger.info(f"Fetched {len(results)} pages, total so far: {len(all_pages)}")
-            
-            # Small delay to avoid rate limiting
-            time.sleep(0.1)
+            if len(results) < limit:
+                break
+                
+            start += len(results)
+            time.sleep(0.1)  # Avoid rate limiting
         
-        # Cache the results
-        self.cache.set(cache_key, all_pages, "metadata")
+        logger.info(f"Found {len(all_pages)} pages in space {space_key}")
         
-        logger.info(f"Successfully fetched {len(all_pages)} pages from space {space_key}")
+        # Save to cache
+        try:
+            with open(PAGE_INDEX_FILE, 'wb') as f:
+                pickle.dump(all_pages, f)
+                logger.info(f"Saved {len(all_pages)} pages to cache")
+        except Exception as e:
+            logger.warning(f"Failed to save page index to cache: {str(e)}")
+        
         return all_pages
     
     def get_page_with_content(self, page_id):
-        """
-        Get a page with its content and metadata.
-        
-        Args:
-            page_id: The ID of the page
-            
-        Returns:
-            Page object with content or None if not found
-        """
-        # Check cache first
-        cache_key = f"page_with_content_{page_id}"
-        cached_page = self.cache.get(cache_key, "content")
-        if cached_page:
-            return cached_page
-        
-        # Get page with content and expanded properties
-        url = f"{self.api_url}/content/{page_id}"
-        params = {
-            "expand": "body.storage,metadata.labels,history.lastUpdated,version,children.attachment"
-        }
-        
-        page = self._make_api_request(url, params=params)
-        if not page:
-            return None
-        
-        # Cache and return
-        self.cache.set(cache_key, page, "content")
-        return page
-    
-    def search_content(self, cql, limit=100, expand="body.storage", all_results=False):
-        """
-        Search for content using Confluence Query Language (CQL).
-        
-        Args:
-            cql: Confluence Query Language query string
-            limit: Maximum number of results per request
-            expand: Fields to expand in results
-            all_results: Whether to fetch all matching results through pagination
-            
-        Returns:
-            List of search results or empty list on error
-        """
-        url = f"{self.api_url}/content/search"
-        
-        if all_results:
-            # Get all results via pagination
-            all_results = []
-            start = 0
-            has_more = True
-            
-            while has_more:
-                params = {
-                    "cql": cql,
-                    "limit": limit,
-                    "start": start,
-                    "expand": expand
-                }
-                
-                response_data = self._make_api_request(url, params=params)
-                
-                if not response_data:
-                    break
-                
-                results = response_data.get("results", [])
-                all_results.extend(results)
-                
-                # Check if there are more pages
-                if "size" in response_data and "limit" in response_data:
-                    if response_data["size"] < response_data["limit"]:
-                        has_more = False
-                    else:
-                        start += response_data["size"]
-                else:
-                    has_more = False
-                
-                # Avoid rate limiting
-                time.sleep(0.1)
-            
-            return all_results
-        else:
-            # Get single page of results
-            params = {
-                "cql": cql,
-                "limit": limit,
-                "expand": expand
+        """Get a page with its content."""
+        logger.info(f"Getting page content: {page_id}")
+        return self._make_request(
+            f"{self.api_url}/content/{page_id}",
+            params={
+                "expand": "body.storage,metadata.labels,history.lastUpdated,children.attachment"
             }
-            
-            response_data = self._make_api_request(url, params=params)
-            
-            if not response_data:
-                return []
-            
-            return response_data.get("results", [])
+        )
     
-    def get_content_by_id(self, content_id, expand="body.storage"):
-        """
-        Get content by ID with expanded fields.
+    def get_page_content(self, page_id):
+        """Get page content and extract all information."""
+        # Check cache
+        cache_path = os.path.join(PROCESSED_CONTENT_DIR, f"{page_id}.pickle")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read processed content from cache: {str(e)}")
         
-        Args:
-            content_id: The ID of the content to retrieve
-            expand: Comma separated list of fields to expand
-            
-        Returns:
-            Content object or None if not found
-        """
-        url = f"{self.api_url}/content/{content_id}"
-        params = {"expand": expand}
-        
-        return self._make_api_request(url, params=params)
-    
-    def extract_and_process_page_content(self, page_id):
-        """
-        Get a page by ID, extract its content, and process it for searching and analysis.
-        
-        Args:
-            page_id: The ID of the page
-            
-        Returns:
-            Dict with processed content or None if failed
-        """
-        # Check cache first
-        cache_key = f"processed_content_{page_id}"
-        cached_content = self.cache.get(cache_key, "content")
-        if cached_content:
-            return cached_content
-        
-        # Get page with content
-        page = self.get_page_with_content(page_id)
-        if not page:
+        # Get page content
+        page_data = self.get_page_with_content(page_id)
+        if not page_data or "body" not in page_data:
+            logger.warning(f"Failed to get content for page: {page_id}")
             return None
         
         # Extract HTML content
-        html_content = page.get("body", {}).get("storage", {}).get("value", "")
+        html_content = page_data["body"]["storage"]["value"]
         if not html_content:
             return None
         
-        # Get metadata
-        title = page.get("title", "")
-        updated_date = page.get("history", {}).get("lastUpdated", {}).get("when", "")
-        labels = [label.get("name") for label in page.get("metadata", {}).get("labels", {}).get("results", [])]
+        # Get page URL
+        page_url = f"{self.base_url}/pages/viewpage.action?pageId={page_id}"
         
-        # Process content with advanced extractor
-        processed_content = AdvancedContentExtractor.extract_content_from_html(html_content, title)
+        # Extract all content
+        extracted = ComprehensiveContentExtractor.extract_all(html_content, page_url)
         
         # Add metadata
-        processed_content["page_id"] = page_id
-        processed_content["url"] = f"{self.base_url}/pages/viewpage.action?pageId={page_id}"
-        processed_content["labels"] = labels
-        processed_content["updated_date"] = updated_date
+        extracted["page_id"] = page_id
+        extracted["url"] = page_url
+        extracted["space_key"] = page_data.get("space", {}).get("key", "")
+        extracted["title"] = page_data.get("title", "")
+        extracted["labels"] = [label.get("name") for label in page_data.get("metadata", {}).get("labels", {}).get("results", [])]
+        extracted["last_updated"] = page_data.get("history", {}).get("lastUpdated", {}).get("when", "")
         
-        # Cache the processed content
-        self.cache.set(cache_key, processed_content, "content")
+        # Save to cache
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(extracted, f)
+        except Exception as e:
+            logger.warning(f"Failed to write processed content to cache: {str(e)}")
         
-        return processed_content
-
-
-class GeminiAssistant:
-    """Enhanced class for interacting with Gemini models via Vertex AI."""
+        return extracted
     
-    def __init__(self):
-        """Initialize the Gemini assistant."""
+    def get_content_from_link(self, link, depth=0):
+        """
+        Get content from a link, following Confluence page links.
+        Returns the extracted content or None if not applicable.
+        """
+        if depth > MAX_LINK_DEPTH:
+            return None
+        
+        if not link.get("is_confluence_page"):
+            return None
+        
+        # Skip already processed links
+        url = link.get("url")
+        if url in self.processed_links:
+            return None
+        
+        with self.lock:
+            self.processed_links.add(url)
+        
+        # If we have a page ID, use that
+        page_id = link.get("page_id")
+        if page_id:
+            return self.get_page_content(page_id)
+        
+        # Otherwise, try to fetch by URL
+        try:
+            # Extract page ID from URL if possible
+            parsed_url = urlparse(url)
+            if 'pageId=' in parsed_url.query:
+                page_id = parse_qs(parsed_url.query).get('pageId', [None])[0]
+                if page_id:
+                    return self.get_page_content(page_id)
+            
+            # Fallback: direct HTTP request
+            cache_key = hashlib.md5(url.encode()).hexdigest()
+            cache_path = os.path.join(REFERENCED_CONTENT_DIR, f"{cache_key}.pickle")
+            
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, 'rb') as f:
+                        return pickle.load(f)
+                except Exception:
+                    pass
+            
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            
+            html_content = response.text
+            extracted = ComprehensiveContentExtractor.extract_all(html_content, url)
+            
+            # Add basic metadata
+            extracted["url"] = url
+            extracted["is_referenced"] = True
+            
+            # Save to cache
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(extracted, f)
+            except Exception:
+                pass
+            
+            return extracted
+        except Exception as e:
+            logger.warning(f"Failed to get content from link {url}: {str(e)}")
+            return None
+    
+    def follow_links(self, page_content, max_links=MAX_LINKS_PER_PAGE):
+        """
+        Follow relevant links from a page to gather more information.
+        Returns a list of content from followed links.
+        """
+        if not page_content or "links" not in page_content:
+            return []
+        
+        relevant_links = []
+        
+        # Find most relevant links
+        for link in page_content["links"]:
+            if link.get("is_confluence_page"):
+                # Skip external links
+                if not link.get("is_internal"):
+                    continue
+                
+                # Calculate relevance based on context
+                relevance = 0
+                
+                # Links with COPPER in text or context
+                if "COPPER" in link["text"] or "COPPER" in link.get("context", ""):
+                    relevance += 3
+                
+                # Links with API in text or context
+                if "API" in link["text"] or "API" in link.get("context", ""):
+                    relevance += 2
+                
+                # Links with database terms
+                db_terms = ["database", "table", "view", "schema", "column", "field"]
+                for term in db_terms:
+                    if term in link["text"].lower() or term in link.get("context", "").lower():
+                        relevance += 1
+                
+                # Add to relevant links if score > 0
+                if relevance > 0:
+                    relevant_links.append((link, relevance))
+        
+        # Sort by relevance and limit
+        relevant_links.sort(key=lambda x: x[1], reverse=True)
+        relevant_links = relevant_links[:max_links]
+        
+        # Follow links in parallel
+        referenced_content = []
+        
+        with ThreadPoolExecutor(max_workers=min(len(relevant_links), 3)) as executor:
+            futures = []
+            for link, _ in relevant_links:
+                futures.append(executor.submit(self.get_content_from_link, link))
+            
+            for future in futures:
+                try:
+                    content = future.result()
+                    if content:
+                        referenced_content.append(content)
+                except Exception as e:
+                    logger.error(f"Error following link: {str(e)}")
+        
+        return referenced_content
+    
+    def search_content(self, query, space_key=None, limit=MAX_RESULTS):
+        """
+        Search for content using CQL.
+        Returns search results ordered by relevance.
+        """
+        logger.info(f"Searching for content: {query}")
+        
+        # Extract terms from query
+        terms = re.findall(r'\b\w{3,}\b', query.lower())
+        if not terms:
+            return []
+        
+        # Build CQL query
+        space_clause = f'space = "{space_key}" AND ' if space_key else ''
+        
+        # Use OR between terms for broader results
+        term_clauses = []
+        for term in terms:
+            # Higher weight for title matches
+            term_clauses.append(f'title ~ "{term}"^3')
+            # Standard weight for content matches
+            term_clauses.append(f'text ~ "{term}"')
+        
+        cql = f'{space_clause}({" OR ".join(term_clauses)})'
+        
+        # Make the search request
+        response = self._make_request(
+            f"{self.api_url}/content/search",
+            params={"cql": cql, "limit": limit, "expand": "space"}
+        )
+        
+        if not response or "results" not in response:
+            return []
+        
+        results = response["results"]
+        
+        # Format the results
+        formatted_results = []
+        for result in results:
+            formatted_results.append({
+                "id": result["id"],
+                "title": result["title"],
+                "url": f"{self.base_url}/pages/viewpage.action?pageId={result['id']}",
+                "space_key": result.get("space", {}).get("key", ""),
+                "type": result.get("type", "")
+            })
+        
+        return formatted_results
+
+
+class IntelligentContentManager:
+    """Manages content extraction, caching, and relevance assessment."""
+    
+    def __init__(self, confluence_client):
+        """Initialize with a Confluence client."""
+        self.confluence = confluence_client
+        self.extractor = ComprehensiveContentExtractor
+        
+        # In-memory caches for faster access
+        self.page_cache = {}
+        self.reference_cache = {}
+        
+        # Track references between pages
+        self.reference_graph = defaultdict(set)
+    
+    def process_page(self, page_id, follow_links=True):
+        """
+        Process a page and all its linked content.
+        Returns the complete extracted content.
+        """
+        # Check in-memory cache
+        if page_id in self.page_cache:
+            return self.page_cache[page_id]
+        
+        # Get page content
+        content = self.confluence.get_page_content(page_id)
+        if not content:
+            return None
+        
+        # Cache the content
+        self.page_cache[page_id] = content
+        
+        # Follow links if requested
+        referenced_content = []
+        if follow_links:
+            referenced_content = self.confluence.follow_links(content)
+            
+            # Update reference graph
+            for ref in referenced_content:
+                ref_id = ref.get("page_id")
+                if ref_id:
+                    self.reference_graph[page_id].add(ref_id)
+                    self.reference_cache[ref_id] = ref
+        
+        return content
+    
+    def assess_relevance(self, content, query):
+        """
+        Assess the relevance of content to a query.
+        Returns a score between 0.0 and 1.0.
+        """
+        if not content:
+            return 0.0
+        
+        # Extract query terms
+        query_lower = query.lower()
+        query_terms = set(re.findall(r'\b\w{3,}\b', query_lower))
+        
+        # Calculate relevance score
+        score = 0.0
+        
+        # Title match (highest weight)
+        title = content.get("title", "").lower()
+        title_matches = sum(1 for term in query_terms if term in title)
+        title_score = title_matches / len(query_terms) if query_terms else 0
+        score += title_score * 0.4
+        
+        # Check if query is about "what is COPPER" or similar
+        is_definition_query = any(p in query_lower for p in ["what is", "definition", "full form", "meaning of", "stands for"])
+        if is_definition_query and "COPPER" in query.upper():
+            # Check definitions for relevance
+            for definition in content.get("definitions", []):
+                if "COPPER" in definition.get("term", ""):
+                    score += 0.4
+                    break
+        
+        # Check if query is about API endpoints
+        is_api_query = any(p in query_lower for p in ["api", "endpoint", "rest", "http", "url"])
+        if is_api_query:
+            # Check for API references in tables and text
+            has_api_tables = any("API" in table.get("caption", "") for table in content.get("tables", []))
+            if has_api_tables:
+                score += 0.3
+            
+            # Check for API or endpoint in headings
+            api_headings = any("API" in heading.get("text", "") or "endpoint" in heading.get("text", "").lower() for heading in content.get("headings", []))
+            if api_headings:
+                score += 0.2
+        
+        # Raw text match for all query terms
+        raw_text = content.get("raw_text", "").lower()
+        for term in query_terms:
+            if term in raw_text:
+                score += 0.05
+        
+        # Special handling for tables
+        tables = content.get("tables", [])
+        if tables:
+            table_score = 0.0
+            for table in tables:
+                # Check table caption for query terms
+                caption = table.get("caption", "").lower()
+                caption_matches = sum(1 for term in query_terms if term in caption)
+                if caption_matches > 0:
+                    table_score += 0.1
+                
+                # Check table content for query terms
+                table_text = "\n".join(" ".join(str(cell) for cell in row) for row in table.get("rows", []))
+                table_text = table_text.lower()
+                table_matches = sum(1 for term in query_terms if term in table_text)
+                if table_matches > 0:
+                    table_score += 0.1
+            
+            score += min(0.3, table_score)  # Cap table score at 0.3
+        
+        # Normalize score to be between 0 and 1
+        return min(1.0, score)
+    
+    def get_relevant_content(self, query, page_ids, threshold=0.6):
+        """
+        Get content relevant to the query from the given pages.
+        Returns list of (content, relevance) tuples sorted by relevance.
+        """
+        relevant_content = []
+        
+        # Process pages in parallel
+        with ThreadPoolExecutor(max_workers=min(len(page_ids), MAX_WORKERS)) as executor:
+            futures = []
+            for page_id in page_ids:
+                futures.append(executor.submit(self.process_page, page_id))
+            
+            for future in futures:
+                try:
+                    content = future.result()
+                    if content:
+                        relevance = self.assess_relevance(content, query)
+                        if relevance >= threshold:
+                            relevant_content.append((content, relevance))
+                except Exception as e:
+                    logger.error(f"Error processing page: {str(e)}")
+        
+        # Sort by relevance
+        relevant_content.sort(key=lambda x: x[1], reverse=True)
+        
+        return relevant_content
+    
+    def format_for_context(self, content_items):
+        """
+        Format content items into a context string for Gemini.
+        Returns formatted context string.
+        """
+        if not content_items:
+            return "No relevant content found."
+        
+        context_parts = []
+        
+        for content, relevance in content_items:
+            title = content.get("title", "Untitled")
+            url = content.get("url", "")
+            
+            # Format the content
+            formatted = self.extractor.format_for_context(content)
+            
+            context_parts.append(f"--- PAGE: {title} ---\n{formatted}\nSOURCE: {url}\nRELEVANCE: {relevance:.2f}")
+        
+        return "\n\n".join(context_parts)
+
+
+class UltimateAssistant:
+    """Ultimate assistant for COPPER knowledge with comprehensive extraction."""
+    
+    def __init__(self, confluence_url, username, api_token, space_key):
+        """Initialize the assistant."""
+        self.confluence = EnhancedConfluenceClient(confluence_url, username, api_token)
+        self.content_manager = IntelligentContentManager(self.confluence)
+        self.space_key = space_key
+        self.pages = []
+        
+        # Search index for quick lookups
+        self.page_index = {}  # word -> [page_ids]
+        
         # Initialize Vertex AI
         vertexai.init(project=PROJECT_ID, location=REGION)
         self.model = GenerativeModel(MODEL_NAME)
-        logger.info(f"Initialized Gemini Assistant with model: {MODEL_NAME}")
     
-    def generate_response(self, prompt, context=None, temperature=0.2):
-        """
-        Generate a response from Gemini based on the prompt and context.
+    def initialize(self):
+        """Initialize the assistant."""
+        logger.info("Initializing Ultimate COPPER Assistant...")
         
-        Args:
-            prompt: The user's question or prompt
-            context: Context information (from Confluence)
-            temperature: Temperature parameter for generation (0.0-1.0)
+        # Test connection
+        if not self.confluence.test_connection():
+            logger.error("Failed to connect to Confluence")
+            return False
+        
+        # Load all pages
+        self.pages = self.confluence.get_all_pages_in_space(self.space_key)
+        if not self.pages:
+            logger.error(f"No pages found in space: {self.space_key}")
+            return False
+        
+        # Build simple index for quick lookups
+        logger.info("Building search index...")
+        self._build_index()
+        
+        logger.info("Initialization complete")
+        return True
+    
+    def _build_index(self):
+        """Build a simple search index for quick lookups."""
+        # Check for existing index
+        index_path = os.path.join(CACHE_DIR, "word_index.pickle")
+        if os.path.exists(index_path):
+            try:
+                with open(index_path, 'rb') as f:
+                    self.page_index = pickle.load(f)
+                logger.info(f"Loaded search index with {len(self.page_index)} terms")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load search index: {str(e)}")
+        
+        # Build from titles and labels
+        for page in self.pages:
+            page_id = page.get("id")
+            title = page.get("title", "").lower()
             
-        Returns:
-            The generated response
+            # Index title words
+            title_words = re.findall(r'\b\w{3,}\b', title)
+            for word in title_words:
+                if word not in self.page_index:
+                    self.page_index[word] = []
+                self.page_index[word].append(page_id)
+            
+            # Index labels
+            labels = [label.get("name", "").lower() for label in 
+                     page.get("metadata", {}).get("labels", {}).get("results", [])]
+            
+            for label in labels:
+                label_words = re.findall(r'\b\w{3,}\b', label)
+                for word in label_words:
+                    if word not in self.page_index:
+                        self.page_index[word] = []
+                    self.page_index[word].append(page_id)
+        
+        # Save index
+        try:
+            with open(index_path, 'wb') as f:
+                pickle.dump(self.page_index, f)
+            logger.info(f"Saved search index with {len(self.page_index)} terms")
+        except Exception as e:
+            logger.warning(f"Failed to save search index: {str(e)}")
+    
+    def _search_index(self, query, max_results=MAX_RESULTS):
+        """Search the index for pages matching the query."""
+        # Extract query terms
+        query_terms = re.findall(r'\b\w{3,}\b', query.lower())
+        
+        if not query_terms:
+            return []
+        
+        # Count matches for each page
+        page_counts = defaultdict(int)
+        
+        for term in query_terms:
+            if term in self.page_index:
+                for page_id in self.page_index[term]:
+                    page_counts[page_id] += 1
+        
+        # Sort by match count
+        sorted_pages = sorted(page_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        # Get top results
+        top_results = sorted_pages[:max_results]
+        
+        return [page_id for page_id, _ in top_results]
+    
+    def search(self, query):
         """
-        logger.info(f"Generating response for prompt: {prompt}")
+        Search for content related to the query using multiple methods.
+        Returns list of page IDs to check.
+        """
+        logger.info(f"Searching for: {query}")
+        
+        # Method 1: Use index search
+        indexed_results = self._search_index(query)
+        
+        # Method 2: Use Confluence's API search
+        api_results = self.confluence.search_content(query, self.space_key)
+        api_page_ids = [result["id"] for result in api_results]
+        
+        # Combine results without duplicates
+        all_page_ids = list(set(indexed_results + api_page_ids))
+        
+        # Special handling for "what is COPPER" queries
+        if "what is copper" in query.lower() or "copper stands for" in query.lower() or "full form of copper" in query.lower():
+            # Look for pages with COPPER in title
+            for page in self.pages:
+                if "COPPER" in page.get("title", ""):
+                    if page["id"] not in all_page_ids:
+                        all_page_ids.append(page["id"])
+        
+        # Special handling for API endpoint queries
+        if "api" in query.lower() or "endpoint" in query.lower():
+            # Look for pages with API in title
+            for page in self.pages:
+                if "API" in page.get("title", ""):
+                    if page["id"] not in all_page_ids:
+                        all_page_ids.append(page["id"])
+        
+        logger.info(f"Found {len(all_page_ids)} candidate pages")
+        
+        # If no results, return recently updated pages
+        if not all_page_ids:
+            logger.warning("No search results, using recent pages")
+            
+            # Sort by last updated
+            recent_pages = sorted(
+                self.pages,
+                key=lambda p: p.get("history", {}).get("lastUpdated", {}).get("when", "2000-01-01"),
+                reverse=True
+            )[:10]
+            
+            all_page_ids = [page["id"] for page in recent_pages]
+        
+        return all_page_ids
+    
+    def answer_question(self, question):
+        """Answer a question with detailed information from all sources."""
+        logger.info(f"Processing question: {question}")
+        
+        start_time = time.time()
+        
+        # Step 1: Search for relevant pages
+        candidate_page_ids = self.search(question)
+        
+        if not candidate_page_ids:
+            logger.warning("No candidate pages found")
+            return "I couldn't find specific information about that in the COPPER documentation. Could you try rephrasing your question?"
+        
+        # Step 2: Assess relevance and get content
+        relevant_content = self.content_manager.get_relevant_content(question, candidate_page_ids)
+        
+        if not relevant_content:
+            logger.warning("No relevant content found")
+            return "I found some pages related to your question, but they don't contain specific information about what you're asking. Could you try asking in a different way?"
+        
+        # Step 3: Format content for context
+        context = self.content_manager.format_for_context(relevant_content)
+        
+        # Step 4: Generate answer
+        answer = self._generate_answer(question, context)
+        
+        end_time = time.time()
+        logger.info(f"Question answered in {end_time - start_time:.2f} seconds")
+        
+        return answer
+    
+    def _generate_answer(self, question, context):
+        """Generate an answer using Gemini."""
+        logger.info("Generating answer with Gemini")
         
         try:
-            # Enhanced system prompt tailored for the task
+            # Create system prompt optimized for COPPER knowledge
             system_prompt = """
-            You are the COPPER Knowledge Assistant, an expert on database views, REST APIs, and system integration.
+            You are the Ultimate COPPER Knowledge Assistant, an expert on the COPPER database system, its views, and REST APIs.
             
-            Your personality:
-            - Conversational, friendly, and helpful - like a knowledgeable colleague
-            - Clear and precise in technical explanations
-            - You simplify complex concepts without oversimplifying
-            - You recognize patterns and connections across documentation
+            When answering:
+            1. Be direct and thorough - answer the specific question first
+            2. Include specific details, values, and examples from the documentation
+            3. If asked about the full form or meaning of COPPER, provide that information explicitly
+            4. If asked about API endpoints, list them with their full details including parameters and responses
+            5. Format information from tables clearly to preserve structure
+            6. Include captions and context from images when relevant
+            7. Use code examples when they help explain a concept
             
-            Your knowledge:
-            - Deep expertise in the COPPER database and API system
-            - Understanding of database views, table structures, and API endpoints
-            - Familiarity with database-to-API mapping patterns
+            When working with the provided context:
+            - Look for exact definitions or explanations in the text
+            - Pay special attention to structured content like tables and definitions
+            - Consider all pages in the context, not just the first one
+            - If there are conflicting answers, explain the differences
+            - Synthesize information from multiple sources when appropriate
             
-            When answering questions:
-            1. Be direct and thorough - answer the specific question first, then provide helpful context
-            2. Include specific details from the documentation rather than general statements
-            3. If tables are relevant to the answer, include their structure and explain relationships
-            4. Reference specific API endpoints, parameters, or database fields when applicable
-            5. Format your responses for readability, using lists and proper spacing
-            6. For acronyms or special terms, provide definitions or explanations
-            7. Look for the "full form" of acronyms like COPPER if asked
-            8. Thoroughly explain API endpoints when requested
-            
-            Remember that you have been provided with extensive documentation about COPPER.
-            Use this information to give precise, helpful answers. If you're not sure about something,
-            acknowledge what you don't know rather than making up information.
+            Remember: You have been provided with comprehensive documentation about COPPER. Use this information
+            to give precise, helpful answers with specific details and examples.
             """
             
-            # Craft the full prompt with context
-            full_prompt = system_prompt + "\n\n"
+            # Full prompt with context
+            full_prompt = f"{system_prompt}\n\nCONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:"
             
-            if context:
-                # Handle large contexts intelligently by summarizing when needed
-                if len(context) > 28000:  # Generous limit for context window
-                    logger.warning(f"Context too large ({len(context)} chars), performing intelligent trimming...")
-                    
-                    # Split context into manageable chunks by page/section
-                    context_sections = context.split("\n\n--- FROM:")
-                    
-                    # Keep introduction and essential parts
-                    trimmed_context = context_sections[0]
-                    
-                    # Add most relevant sections
-                    for section in context_sections[1:]:
-                        if len(trimmed_context) + len(section) + 10 < 28000:
-                            trimmed_context += "\n\n--- FROM:" + section
-                        else:
-                            # We've reached our limit
-                            break
-                    
-                    context = trimmed_context
-                    logger.info(f"Trimmed context to {len(context)} chars")
-                
-                full_prompt += "CONTEXT FROM COPPER DOCUMENTATION:\n" + context + "\n\n"
-                
-            full_prompt += f"USER QUESTION: {prompt}\n\nResponse:"
-            
-            # Configure generation parameters
+            # Generate response
             generation_config = GenerationConfig(
-                temperature=temperature,
+                temperature=0.2,
                 top_p=0.95,
                 max_output_tokens=2048,
             )
             
-            # Generate the response
             response = self.model.generate_content(
                 full_prompt,
                 generation_config=generation_config,
             )
             
             if response.candidates and response.candidates[0].text:
-                response_text = response.candidates[0].text.strip()
-                logger.info(f"Successfully generated response ({len(response_text)} chars)")
-                return response_text
+                return response.candidates[0].text.strip()
             else:
-                logger.warning("No response generated from Gemini")
-                return "I couldn't find a clear answer to that question in the COPPER documentation. Would you like me to look for related information instead?"
+                logger.warning("Empty response from Gemini")
+                return "I couldn't generate a response based on the information I found. Please try asking in a different way."
                 
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            return f"I encountered a technical issue while processing your question. Please try asking in a different way or ask another question."
-    
-    def categorize_question(self, question):
-        """
-        Analyze the question to determine its category for better context selection.
-        
-        Args:
-            question: The user's question
-            
-        Returns:
-            Dictionary with question category and key terms
-        """
-        # Define common question categories and associated terms
-        categories = {
-            "definition": ["what is", "what are", "define", "meaning", "full form", "acronym", "stand for", "definition"],
-            "api_endpoints": ["api endpoint", "endpoints", "rest api", "api", "request", "response", "url", "http"],
-            "database": ["table", "view", "column", "field", "schema", "database", "query", "sql"],
-            "mapping": ["map", "mapping", "relationship", "connect", "link", "correspond", "translation"],
-            "configuration": ["config", "configure", "setup", "setting", "parameter", "property"],
-            "tutorial": ["how to", "tutorial", "guide", "steps", "procedure", "example"]
-        }
-        
-        # Normalize question
-        question_lower = question.lower()
-        
-        # Score each category
-        category_scores = {}
-        for category, terms in categories.items():
-            score = 0
-            for term in terms:
-                if term in question_lower:
-                    score += 1
-            category_scores[category] = score
-        
-        # Get top categories (may be more than one)
-        max_score = max(category_scores.values())
-        if max_score > 0:
-            top_categories = [c for c, s in category_scores.items() if s == max_score]
-        else:
-            # Default to general question if no clear category
-            top_categories = ["general"]
-        
-        # Extract potential key terms (nouns, technical terms, etc.)
-        key_terms = []
-        
-        # Look for quoted terms
-        quoted_terms = re.findall(r'"([^"]+)"', question) + re.findall(r"'([^']+)'", question)
-        if quoted_terms:
-            key_terms.extend(quoted_terms)
-        
-        # Look for technical terms using common patterns
-        # Acronyms
-        acronyms = re.findall(r'\b[A-Z]{2,}\b', question)
-        if acronyms:
-            key_terms.extend(acronyms)
-        
-        # CamelCase terms
-        camel_case = re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]+\b', question)
-        if camel_case:
-            key_terms.extend(camel_case)
-        
-        # Terms with underscores
-        underscored = re.findall(r'\b\w+_\w+\b', question)
-        if underscored:
-            key_terms.extend(underscored)
-        
-        return {
-            "categories": top_categories,
-            "key_terms": key_terms,
-            "original_question": question
-        }
-
-
-class CopperAssistant:
-    """Main class that coordinates between Confluence and Gemini."""
-    
-    def __init__(self, confluence_url, confluence_username, confluence_api_token, space_key=None):
-        """
-        Initialize the COPPER Assistant.
-        
-        Args:
-            confluence_url: The Confluence URL
-            confluence_username: Confluence username
-            confluence_api_token: Confluence API token
-            space_key: The Confluence space key to focus on
-        """
-        self.confluence = ConfluenceClient(confluence_url, confluence_username, confluence_api_token)
-        self.gemini = GeminiAssistant()
-        self.space_key = space_key
-        self.space_pages = []
-        self.processed_pages = {}
-        logger.info(f"Initialized COPPER Assistant targeting space: {space_key or 'all spaces'}")
-    
-    def initialize(self):
-        """Initialize the assistant by testing connections and loading content."""
-        logger.info("Initializing COPPER Assistant...")
-        
-        if not self.confluence.test_connection():
-            logger.error("Failed to connect to Confluence. Check credentials and URL.")
-            return False
-        
-        logger.info("Connection to Confluence successful.")
-        
-        # Load space information
-        if self.space_key:
-            space_info = self.confluence.get_space_info(self.space_key)
-            if not space_info:
-                logger.error(f"Failed to get information for space {self.space_key}.")
-                return False
-            
-            logger.info(f"Successfully loaded information for space {self.space_key}: {space_info.get('name', 'Unknown')}")
-            
-            # Load all pages in the space
-            self.load_all_space_content()
-        
-        return True
-    
-    def load_all_space_content(self):
-        """Load ALL pages in the specified space."""
-        if not self.space_key:
-            logger.error("No space key specified. Please provide a space key.")
-            return
-        
-        logger.info(f"Loading all pages in space {self.space_key}...")
-        
-        # Get all pages in the space
-        self.space_pages = self.confluence.get_all_pages_in_space(self.space_key)
-        
-        logger.info(f"Loaded metadata for {len(self.space_pages)} pages from space {self.space_key}")
-    
-    def preprocess_all_pages(self):
-        """
-        Extract and process content from all pages.
-        This can be done in advance to speed up queries.
-        """
-        if not self.space_pages:
-            logger.error("No pages loaded. Call load_all_space_content() first.")
-            return
-        
-        logger.info(f"Preprocessing content from {len(self.space_pages)} pages...")
-        
-        # Use a thread pool to process pages in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Submit all page processing tasks
-            future_to_page = {
-                executor.submit(self.confluence.extract_and_process_page_content, page['id']): page['id']
-                for page in self.space_pages
-            }
-            
-            # Collect results as they complete
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_page)):
-                page_id = future_to_page[future]
-                try:
-                    processed_content = future.result()
-                    if processed_content:
-                        self.processed_pages[page_id] = processed_content
-                except Exception as e:
-                    logger.error(f"Error processing page {page_id}: {str(e)}")
-                
-                # Log progress periodically
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Processed {i + 1}/{len(self.space_pages)} pages")
-        
-        logger.info(f"Successfully preprocessed {len(self.processed_pages)} pages")
-    
-    def _fetch_page_content_batch(self, page_ids):
-        """
-        Fetch content for a batch of pages in parallel.
-        
-        Args:
-            page_ids: List of page IDs to fetch
-            
-        Returns:
-            Dictionary mapping page IDs to their processed content
-        """
-        results = {}
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Submit all content extraction tasks
-            future_to_page = {
-                executor.submit(self.confluence.extract_and_process_page_content, page_id): page_id
-                for page_id in page_ids
-            }
-            
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_page):
-                page_id = future_to_page[future]
-                try:
-                    content = future.result()
-                    if content:
-                        results[page_id] = content
-                except Exception as e:
-                    logger.error(f"Error fetching content for page {page_id}: {str(e)}")
-        
-        return results
-    
-    def find_relevance_to_query(self, query, page_content):
-        """
-        Calculate relevance score between a query and page content.
-        
-        Args:
-            query: The user's query
-            page_content: Dict with processed page content
-            
-        Returns:
-            Float relevance score between 0.0 and 1.0
-        """
-        # Categorize the question for better matching
-        question_info = self.gemini.categorize_question(query)
-        categories = question_info["categories"]
-        key_terms = question_info["key_terms"]
-        
-        # Extract useful content fields
-        title = page_content.get("title", "").lower()
-        headings = [h["text"].lower() for h in page_content.get("headings", [])]
-        raw_text = page_content.get("raw_text", "").lower()
-        labels = [label.lower() for label in page_content.get("labels", [])]
-        
-        # Prepare query terms
-        query_lower = query.lower()
-        query_words = set(re.findall(r'\b\w+\b', query_lower))
-        
-        # Start with a base score
-        score = 0.0
-        
-        # Check for exact query matches (highest priority)
-        if query_lower in raw_text:
-            score += 0.4
-        
-        # Check for key terms (high priority)
-        for term in key_terms:
-            term_lower = term.lower()
-            # Term in title is very important
-            if term_lower in title:
-                score += 0.3
-            # Term in headings is important
-            if any(term_lower in heading for heading in headings):
-                score += 0.2
-            # Term in text
-            if term_lower in raw_text:
-                score += 0.1
-        
-        # Check for query words (medium priority)
-        words_in_title = sum(1 for word in query_words if word in title)
-        title_match_ratio = words_in_title / len(query_words) if query_words else 0
-        score += title_match_ratio * 0.2
-        
-        # For specific question categories, check for relevant content
-        if "definition" in categories:
-            # Look for definition patterns
-            definition_patterns = [
-                r'\b(stands for|is an acronym for|is short for)\b',
-                r'\b(is|are|means|refers to|defined as)\b.*\b(a|an|the)\b',
-                r':.*\.',  # Colon followed by definition
-                r'=.*\.'   # Equals sign followed by definition
-            ]
-            
-            if any(re.search(pattern, raw_text) for pattern in definition_patterns):
-                score += 0.2
-        
-        elif "api_endpoints" in categories:
-            # Check for API endpoint references
-            api_patterns = [
-                r'/api/',
-                r'(endpoint|rest|http|api)',
-                r'(get|post|put|delete)\s+request',
-                r'(curl|fetch|request)'
-            ]
-            
-            if any(re.search(pattern, raw_text, re.IGNORECASE) for pattern in api_patterns):
-                score += 0.2
-        
-        # Check for relevant tables if query suggests database or structure interest
-        if "database" in categories or "mapping" in categories:
-            tables = page_content.get("tables", [])
-            if tables:
-                table_count = len(tables)
-                score += min(0.2, table_count * 0.05)  # Up to 0.2 for tables
-        
-        # Check page labels for relevance
-        if "copper" in labels:
-            score += 0.1
-        
-        # Normalize the score to be between 0 and 1
-        return min(1.0, score)
-    
-    def search_for_content(self, query):
-        """
-        Search for relevant content across all pages.
-        
-        Args:
-            query: The user's query
-            
-        Returns:
-            List of (page, relevance_score) tuples sorted by relevance
-        """
-        if not self.space_pages:
-            logger.error("No pages loaded. Call load_all_space_content() first.")
-            return []
-        
-        logger.info(f"Searching for content related to: {query}")
-        
-        # Step 1: Perform initial filtering based on page metadata
-        # This helps focus detailed analysis on promising candidates
-        candidate_pages = []
-        
-        # Extract key terms from query
-        query_lower = query.lower()
-        query_words = set(re.findall(r'\b\w+\b', query_lower))
-        
-        # Try direct Confluence search via CQL for faster initial filtering
-        # This leverages Confluence's built-in search index
-        try:
-            search_terms = " OR ".join(f'"{word}"' for word in query_words if len(word) > 3)
-            cql = f'space="{self.space_key}" AND text ~ ({search_terms})'
-            
-            search_results = self.confluence.search_content(
-                cql=cql,
-                limit=30,
-                expand="",  # No need for content in initial filter
-                all_results=False
-            )
-            
-            # Create a set of page IDs from search results for quick lookup
-            search_page_ids = {result.get("id") for result in search_results}
-            
-            # Add search results to candidates
-            for page in self.space_pages:
-                page_id = page.get("id")
-                title = page.get("title", "").lower()
-                
-                # Give high priority to pages found by Confluence search
-                if page_id in search_page_ids:
-                    candidate_pages.append(page)
-                # Also include pages with query terms in title
-                elif any(word in title for word in query_words):
-                    candidate_pages.append(page)
-            
-            logger.info(f"Initial filtering found {len(candidate_pages)} candidate pages")
-            
-            # If few candidates found, include more pages
-            if len(candidate_pages) < 15:
-                # Add pages with title suggestions
-                for page in self.space_pages:
-                    if page not in candidate_pages:
-                        title = page.get("title", "").lower()
-                        # Check for partial title matches
-                        if any(word[:4] in title for word in query_words if len(word) > 4):
-                            candidate_pages.append(page)
-                
-                logger.info(f"Expanded to {len(candidate_pages)} candidate pages")
-            
-            # Backup: if still few candidates, take most recently updated pages
-            if len(candidate_pages) < 10:
-                recent_pages = sorted(
-                    self.space_pages, 
-                    key=lambda p: p.get("history", {}).get("lastUpdated", {}).get("when", "2000-01-01"),
-                    reverse=True
-                )[:20]
-                
-                for page in recent_pages:
-                    if page not in candidate_pages:
-                        candidate_pages.append(page)
-                
-                logger.info(f"Added recent pages, now have {len(candidate_pages)} candidates")
-            
-        except Exception as e:
-            logger.error(f"Error in initial content filtering: {str(e)}")
-            # Fall back to using all pages if search fails
-            candidate_pages = self.space_pages[:50]  # Limit to first 50 for performance
-        
-        # Step 2: Fetch content for candidates in parallel
-        logger.info(f"Fetching content for {len(candidate_pages)} candidate pages...")
-        
-        # Fetch content for candidates
-        page_ids = [page.get("id") for page in candidate_pages]
-        candidate_contents = self._fetch_page_content_batch(page_ids)
-        
-        logger.info(f"Successfully fetched content for {len(candidate_contents)} pages")
-        
-        # Step 3: Score all candidates for relevance
-        scored_pages = []
-        
-        for page_id, content in candidate_contents.items():
-            relevance = self.find_relevance_to_query(query, content)
-            
-            # Include pages with sufficient relevance
-            if relevance >= RELEVANCE_THRESHOLD:
-                scored_pages.append((content, relevance))
-        
-        # Sort by relevance score (descending)
-        scored_pages.sort(key=lambda x: x[1], reverse=True)
-        
-        logger.info(f"Found {len(scored_pages)} pages above relevance threshold {RELEVANCE_THRESHOLD}")
-        
-        return scored_pages
-    
-    def format_content_for_context(self, relevant_pages):
-        """
-        Format relevant pages into context for the assistant.
-        
-        Args:
-            relevant_pages: List of (page_content, relevance) tuples
-            
-        Returns:
-            Formatted context string
-        """
-        if not relevant_pages:
-            return "No relevant content found in the documentation."
-        
-        context_parts = []
-        
-        # Add a header
-        context_parts.append(f"I found {len(relevant_pages)} relevant pages in the documentation:")
-        
-        # Process each page in order of relevance
-        for i, (page, relevance) in enumerate(relevant_pages, 1):
-            # Format page content appropriately
-            page_title = page.get("title", "Untitled")
-            page_url = page.get("url", "")
-            
-            # Start with page header
-            page_context = [f"--- FROM: {page_title} ---"]
-            
-            # Include page content structured for readability
-            formatted_content = AdvancedContentExtractor.format_for_context(page)
-            page_context.append(formatted_content)
-            
-            # Add source reference
-            page_context.append(f"Source: {page_url}")
-            
-            # Add to overall context
-            context_parts.append("\n\n".join(page_context))
-        
-        return "\n\n".join(context_parts)
-    
-    def answer_question(self, question):
-        """
-        Answer a question using all available content.
-        
-        Args:
-            question: The user's question
-            
-        Returns:
-            The generated response
-        """
-        logger.info(f"Processing question: {question}")
-        
-        # Search for relevant content
-        start_time = time.time()
-        relevant_pages = self.search_for_content(question)
-        
-        # Check if we found relevant content
-        if not relevant_pages:
-            logger.warning("No relevant content found for the question.")
-            return "I couldn't find specific information about that in the COPPER documentation. Could you try rephrasing your question or ask about a related topic?"
-        
-        # Format content for context
-        context = self.format_content_for_context(relevant_pages)
-        
-        # Generate response using Gemini
-        response = self.gemini.generate_response(question, context)
-        
-        end_time = time.time()
-        logger.info(f"Generated response in {end_time - start_time:.2f} seconds")
-        
-        return response
+            logger.error(f"Error generating answer: {str(e)}")
+            return "I encountered an error while processing your question. Please try again or ask a different question."
 
 
 def main():
-    """Main entry point for the COPPER Assistant."""
-    logger.info("Starting COPPER Assistant")
+    """Main entry point for the assistant."""
+    print("\n==========================================")
+    print("  Ultimate COPPER Knowledge Assistant")
+    print("==========================================")
+    print("\nInitializing...")
     
     # Check for required environment variables
     if not CONFLUENCE_USERNAME or not CONFLUENCE_API_TOKEN:
-        logger.error("Missing Confluence credentials. Please set CONFLUENCE_USERNAME and CONFLUENCE_API_TOKEN environment variables.")
-        print("Error: Missing Confluence credentials. Please set the required environment variables.")
+        print("Error: Missing Confluence credentials. Please set CONFLUENCE_USERNAME and CONFLUENCE_API_TOKEN environment variables.")
         return
     
-    # Show startup message
-    print("\n========================================")
-    print("      COPPER Knowledge Assistant")
-    print("========================================")
-    print("\nInitializing...")
-    print("Connecting to Confluence...")
-    
-    # Initialize the assistant
-    assistant = CopperAssistant(
+    # Initialize assistant
+    assistant = UltimateAssistant(
         confluence_url=CONFLUENCE_URL,
-        confluence_username=CONFLUENCE_USERNAME,
-        confluence_api_token=CONFLUENCE_API_TOKEN,
+        username=CONFLUENCE_USERNAME,
+        api_token=CONFLUENCE_API_TOKEN,
         space_key=CONFLUENCE_SPACE
     )
     
     if not assistant.initialize():
-        logger.error("Failed to initialize COPPER Assistant.")
-        print("Error: Failed to initialize. Please check the logs for details.")
+        print("Error: Failed to initialize assistant. Please check the logs for details.")
         return
     
-    print(f"Connected to Confluence space: {CONFLUENCE_SPACE}")
-    print(f"Loading information from {len(assistant.space_pages)} pages...")
+    print("✓ Connected to Confluence and loaded page information")
+    print(f"✓ Indexed {len(assistant.pages)} pages from the {CONFLUENCE_SPACE} space")
+    print(f"✓ Comprehensive content extraction ready")
+    print("\nYou can now ask questions about COPPER. The assistant will extract information")
+    print("from all available sources including tables, images, and linked pages.")
+    print("\nType 'exit' to quit.")
     
-    # Start interactive loop
-    print("\nCOPPER Knowledge Assistant is ready!")
-    print("Ask anything about COPPER database views, APIs, or mappings.")
-    print("Type 'quit' or 'exit' to end the session.\n")
-    
+    # Main loop
     while True:
+        user_input = input("\nQuestion: ").strip()
+        
+        if user_input.lower() in ('exit', 'quit', 'q'):
+            print("Goodbye!")
+            break
+        
+        if not user_input:
+            continue
+        
+        print("\nSearching and extracting information...")
+        
         try:
-            user_input = input("\nQuestion: ").strip()
-            
-            if user_input.lower() in ('quit', 'exit', 'q'):
-                print("\nThank you for using the COPPER Knowledge Assistant. Goodbye!")
-                break
-            
-            if not user_input:
-                continue
-            
-            print("\nSearching documentation...")
-            
             start_time = time.time()
             answer = assistant.answer_question(user_input)
             end_time = time.time()
@@ -1855,16 +1712,9 @@ def main():
             print("-----------------------------------------------")
             print(answer)
             print("-----------------------------------------------")
-            
-        except KeyboardInterrupt:
-            print("\nSession terminated. Goodbye!")
-            break
         except Exception as e:
-            logger.error(f"Error in main loop: {str(e)}")
-            print(f"\nSorry, I encountered an error: {str(e)}")
-            print("Let's try another question.")
-    
-    print("\nCOPPER Assistant session ended.")
+            logger.error(f"Error processing question: {str(e)}")
+            print(f"Sorry, I encountered an error: {str(e)}")
 
 
 if __name__ == "__main__":
