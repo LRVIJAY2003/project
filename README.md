@@ -4,12 +4,12 @@
 """
 Advanced COPPER View to API Mapper
 ----------------------------------
-A comprehensive solution for mapping database views to REST APIs by:
-1. Extracting knowledge from Confluence and Bitbucket repositories
-2. Analyzing SQL view definitions with advanced parsing techniques
-3. Generating accurate mappings with multi-tier strategy (docs, patterns, AI)
-4. Creating practical API request/response examples
-5. Answering COPPER API questions in a natural, conversational manner
+A robust solution for mapping database views to REST APIs:
+1. Extracts and caches all knowledge from Confluence documentation
+2. Retrieves SQL view definitions from Bitbucket with reliable fallbacks
+3. Accurately maps database views to API endpoints and attributes
+4. Generates comprehensive API request/response examples
+5. Provides conversational, professional assistance for COPPER API questions
 """
 
 import os
@@ -23,12 +23,12 @@ import threading
 from functools import lru_cache
 import requests
 from bs4 import BeautifulSoup
+import hashlib
 import sqlparse
 from urllib.parse import urljoin
-import hashlib
 
 # GenAI imports
-from vertexai.generative_models import GenerationConfig, GenerativeModel, Part
+from vertexai.generative_models import GenerationConfig, GenerativeModel
 import vertexai
 
 # Suppress InsecureRequestWarning
@@ -65,23 +65,23 @@ REPO_SLUG = os.environ.get("REPO_SLUG", "copper_views")
 DIRECTORY_PATH = os.environ.get("DIRECTORY_PATH", "queries")
 
 # Performance settings
-MAX_WORKERS = 8  # Increased for faster concurrent processing
-CACHE_SIZE = 2000  # Increased cache size
-MAX_CONTENT_SIZE = 16000  # Increased content size limit for Gemini
+MAX_WORKERS = 10
+MAX_CONTENT_SIZE = 16000
+NO_LIMIT = 10000  # Effectively no limit on document retrieval
 
-# Important documentation pages that will get a slight additional relevance boost
+# Important documentation pages with direct access IDs
 IMPORTANT_PAGES = {
-    "copper_intro": {"id": "224622013", "title": "COPPER APP/A", "boost": 0.2},
-    "api_faq": {"id": "168711190", "title": "COPPER API Frequently Asked Questions", "boost": 0.3},
-    "view_to_api_mapping": {"id": "168617692", "title": "View to API Mapping", "boost": 0.4},
-    "api_quickstart": {"id": "168687143", "title": "COPPER API QUICK START GUIDE", "boost": 0.3},
-    "api_endpoints": {"id": "168370805", "title": "API Endpoint", "boost": 0.3},
-    "api_landing": {"id": "168508889", "title": "COPPER API First Landing Page", "boost": 0.2},
-    "supported_operators": {"id": "168665138", "title": "COPPER SQL API Supported Operators", "boost": 0.3}
+    "copper_intro": {"id": "224622013", "title": "COPPER APP/A"},
+    "api_faq": {"id": "168711190", "title": "COPPER API Frequently Asked Questions"},
+    "view_to_api_mapping": {"id": "168617692", "title": "View to API Mapping"},
+    "api_quickstart": {"id": "168687143", "title": "COPPER API QUICK START GUIDE"},
+    "api_endpoints": {"id": "168370805", "title": "API Endpoint"},
+    "api_landing": {"id": "168508889", "title": "COPPER API First Landing Page"},
+    "supported_operators": {"id": "168665138", "title": "COPPER SQL API Supported Operators"}
 }
 
 class ContentExtractor:
-    """Extract and structure content from Confluence HTML documents."""
+    """Extract structured content from Confluence HTML documents."""
     
     @staticmethod
     def extract_content(html_content, title=""):
@@ -141,20 +141,47 @@ class ContentExtractor:
                             "text": item_text
                         })
             
-            # Process tables with enhanced metadata detection
+            # Process tables - critical for mapping data
             for i, table in enumerate(soup.find_all('table')):
-                # Get table title/caption
+                # Get table title/caption or use index
                 table_title = table.find('caption')
                 table_title = table_title.text.strip() if table_title else f"Table {i+1}"
                 
-                # Determine table purpose from title or nearby headings
-                table_purpose = ContentExtractor._detect_table_purpose(table, table_title)
+                # Determine table purpose from title or headers
+                table_purpose = "generic"
+                if re.search(r'map|view\s+to\s+api|column', table_title.lower()):
+                    table_purpose = "mapping"
+                elif re.search(r'api|endpoint|rest', table_title.lower()):
+                    table_purpose = "api"
                 
                 # Extract headers
-                headers = ContentExtractor._extract_table_headers(table)
+                headers = []
+                thead = table.find('thead')
+                if thead:
+                    header_row = thead.find('tr')
+                    if header_row:
+                        headers = [th.text.strip() for th in header_row.find_all(['th', 'td'])]
+                
+                # If no thead, try first row
+                if not headers:
+                    first_row = table.find('tr')
+                    if first_row:
+                        first_cells = first_row.find_all(['th', 'td'])
+                        if first_row.find('th') or any('bold' in cell.get('style', '') for cell in first_cells):
+                            headers = [cell.text.strip() for cell in first_cells]
                 
                 # Process rows
-                rows = ContentExtractor._extract_table_rows(table, headers)
+                rows = []
+                skip_first = bool(headers and not thead)
+                table_rows = table.find_all('tr')
+                
+                for idx, tr in enumerate(table_rows):
+                    if skip_first and idx == 0:
+                        continue
+                    
+                    row = [td.text.strip() for td in tr.find_all(['td', 'th'])]
+                    if any(cell for cell in row):  # Skip empty rows
+                        rows.append(row)
                 
                 # Create structured table representation
                 structured_table = {
@@ -165,17 +192,15 @@ class ContentExtractor:
                 }
                 extracted["structured_tables"].append(structured_table)
                 
-                # Create formatted text version for context
-                text_table = ContentExtractor.format_table_as_text(structured_table)
-                extracted["tables"].append(text_table)
+                # Format as text for context
+                table_text = ContentExtractor.format_table_as_text(structured_table)
+                extracted["tables"].append(table_text)
                 
-                # Process special-purpose tables
-                if table_purpose == "mapping":
+                # Process mapping tables
+                if table_purpose == "mapping" or any(re.search(r'view|api|column|attribute', h.lower()) for h in headers):
                     mapping_data = ContentExtractor.extract_mapping_from_table(structured_table)
                     if mapping_data:
                         extracted["view_mappings"].append(mapping_data)
-                elif table_purpose == "api" or table_purpose == "endpoint":
-                    ContentExtractor._extract_api_info_from_table(structured_table, extracted)
             
             # Extract code blocks
             for pre in soup.find_all('pre'):
@@ -187,8 +212,40 @@ class ContentExtractor:
                         "code": code_text
                     })
             
-            # Extract API endpoints from text and tables
-            ContentExtractor._extract_api_endpoints(extracted)
+            # Extract API endpoints
+            api_pattern = r'(/v\d+/[a-zA-Z0-9_/{}.-]+)'
+            
+            for block in extracted["text_blocks"]:
+                if "text" in block:
+                    endpoint_matches = re.findall(api_pattern, block["text"])
+                    for endpoint in endpoint_matches:
+                        if not any(e["endpoint"] == endpoint for e in extracted["api_endpoints"]):
+                            extracted["api_endpoints"].append({
+                                "endpoint": endpoint,
+                                "context": block["text"][:200]
+                            })
+            
+            # Check structured tables for endpoints
+            for table in extracted["structured_tables"]:
+                # Check headers and all cells
+                for header in table["headers"]:
+                    endpoint_matches = re.findall(api_pattern, header)
+                    for endpoint in endpoint_matches:
+                        if not any(e["endpoint"] == endpoint for e in extracted["api_endpoints"]):
+                            extracted["api_endpoints"].append({
+                                "endpoint": endpoint,
+                                "context": f"Found in table: {table['title']}"
+                            })
+                
+                for row in table["rows"]:
+                    for cell in row:
+                        endpoint_matches = re.findall(api_pattern, cell)
+                        for endpoint in endpoint_matches:
+                            if not any(e["endpoint"] == endpoint for e in extracted["api_endpoints"]):
+                                extracted["api_endpoints"].append({
+                                    "endpoint": endpoint,
+                                    "context": f"Found in table: {table['title']}"
+                                })
             
             return extracted
             
@@ -204,173 +261,6 @@ class ContentExtractor:
                 "view_mappings": [],
                 "list_items": []
             }
-    
-    @staticmethod
-    def _detect_table_purpose(table, title):
-        """Determine table purpose based on title and headers."""
-        title_lower = title.lower()
-        
-        # Check title for purpose hints
-        if re.search(r'map|view\s+to\s+api|column\s+to\s+api', title_lower):
-            return "mapping"
-        elif re.search(r'api\s+endpoint|endpoint|operation', title_lower):
-            return "endpoint"
-        elif re.search(r'api\s+parameter|parameter|field', title_lower):
-            return "parameter"
-        elif re.search(r'api\s+response|response', title_lower):
-            return "response"
-        
-        # Check headers
-        headers = ContentExtractor._extract_table_headers(table)
-        headers_text = " ".join(headers).lower()
-        
-        if re.search(r'view|column|api', headers_text) and len(headers) >= 2:
-            return "mapping"
-        elif re.search(r'endpoint|operation|method', headers_text):
-            return "endpoint"
-        elif re.search(r'parameter|field', headers_text):
-            return "parameter"
-        
-        # Default
-        return "generic"
-    
-    @staticmethod
-    def _extract_table_headers(table):
-        """Extract headers from table."""
-        headers = []
-        
-        # Try thead first
-        thead = table.find('thead')
-        if thead:
-            header_row = thead.find('tr')
-            if header_row:
-                headers = [th.text.strip() for th in header_row.find_all(['th', 'td'])]
-        
-        # If no headers in thead, try first row
-        if not headers:
-            first_row = table.find('tr')
-            if first_row:
-                # Check if first row looks like a header
-                if first_row.find('th') or all(cell.get('style') and 'bold' in cell.get('style', '') 
-                                             for cell in first_row.find_all(['td'])):
-                    headers = [cell.text.strip() for cell in first_row.find_all(['th', 'td'])]
-        
-        return headers
-    
-    @staticmethod
-    def _extract_table_rows(table, headers):
-        """Extract rows from table, skipping headers if they were found in first row."""
-        rows = []
-        
-        # Determine where to start based on headers
-        tbody = table.find('tbody')
-        all_rows = tbody.find_all('tr') if tbody else table.find_all('tr')
-        
-        # Skip first row if it was used for headers and no thead was found
-        start_idx = 1 if headers and not table.find('thead') and all_rows else 0
-        
-        for tr in all_rows[start_idx:]:
-            row = [td.text.strip() for td in tr.find_all(['td', 'th'])]
-            if any(cell for cell in row):  # Skip empty rows
-                rows.append(row)
-        
-        return rows
-    
-    @staticmethod
-    def _extract_api_endpoints(extracted):
-        """Extract API endpoints from text and tables."""
-        # Define API endpoint pattern
-        api_pattern = r'(/v\d+/[a-zA-Z0-9_/{}.-]+)'
-        
-        # Extract from text blocks
-        for block in extracted["text_blocks"]:
-            if "text" in block:
-                endpoint_matches = re.findall(api_pattern, block["text"])
-                for endpoint in endpoint_matches:
-                    # Get context from surrounding text
-                    context = block["text"][:300]  # Use a larger context window
-                    ContentExtractor._add_api_endpoint(extracted, endpoint, context)
-        
-        # Extract from lists
-        for item in extracted["list_items"]:
-            endpoint_matches = re.findall(api_pattern, item["text"])
-            for endpoint in endpoint_matches:
-                ContentExtractor._add_api_endpoint(extracted, endpoint, item["text"])
-        
-        # Extract from tables
-        for table in extracted["structured_tables"]:
-            # Check table title first
-            endpoint_matches = re.findall(api_pattern, table["title"])
-            for endpoint in endpoint_matches:
-                ContentExtractor._add_api_endpoint(
-                    extracted, endpoint, f"Found in table: {table['title']}")
-            
-            # Check all cells
-            for row in table["rows"]:
-                for cell in row:
-                    endpoint_matches = re.findall(api_pattern, cell)
-                    for endpoint in endpoint_matches:
-                        # Try to find a description in the same row
-                        desc_idx = -1
-                        cell_idx = row.index(cell)
-                        if len(row) > cell_idx + 1:
-                            desc_idx = cell_idx + 1
-                        elif len(table["headers"]) > cell_idx:
-                            context = f"Related to {table['headers'][cell_idx]}"
-                        else:
-                            context = f"Found in table: {table['title']}"
-                        
-                        desc = row[desc_idx] if desc_idx >= 0 and desc_idx < len(row) else context
-                        ContentExtractor._add_api_endpoint(extracted, endpoint, desc)
-    
-    @staticmethod
-    def _add_api_endpoint(extracted, endpoint, context):
-        """Add API endpoint if not already present."""
-        # Normalize the endpoint
-        endpoint = endpoint.rstrip('?').rstrip(')')
-        
-        # Check if endpoint already exists
-        if not any(e["endpoint"] == endpoint for e in extracted["api_endpoints"]):
-            extracted["api_endpoints"].append({
-                "endpoint": endpoint,
-                "context": context
-            })
-    
-    @staticmethod
-    def _extract_api_info_from_table(table, extracted):
-        """Extract API information from endpoint/parameter tables."""
-        if not table["headers"] or not table["rows"]:
-            return
-        
-        # For endpoint tables, extract full API details
-        if table["purpose"] == "endpoint" or table["purpose"] == "api":
-            for row in table["rows"]:
-                endpoint = None
-                description = None
-                method = None
-                
-                # Try to identify columns by header names
-                for i, header in enumerate(table["headers"]):
-                    header_lower = header.lower()
-                    if i < len(row):
-                        if re.search(r'endpoint|path|url', header_lower):
-                            # Extract endpoint pattern
-                            endpoint_match = re.search(r'(/v\d+/[a-zA-Z0-9_/{}.-]+)', row[i])
-                            if endpoint_match:
-                                endpoint = endpoint_match.group(1)
-                        elif re.search(r'desc|description', header_lower):
-                            description = row[i]
-                        elif re.search(r'method|http|verb', header_lower):
-                            method = row[i]
-                
-                # Add if we found an endpoint
-                if endpoint:
-                    ContentExtractor._add_api_endpoint(
-                        extracted, 
-                        endpoint, 
-                        f"Method: {method}, Description: {description}" if method and description 
-                        else description or f"Found in table: {table['title']}"
-                    )
     
     @staticmethod
     def format_table_as_text(table_data):
@@ -511,24 +401,7 @@ class ContentExtractor:
             for endpoint in extracted_content["api_endpoints"]:
                 result.append(f"- `{endpoint['endpoint']}`: {endpoint.get('context', '')}")
         
-        full_text = "\n\n".join(result)
-        
-        # Truncate if too long, but try to break at paragraph boundaries
-        if len(full_text) > MAX_CONTENT_SIZE:
-            paragraphs = full_text.split("\n\n")
-            truncated = []
-            current_length = 0
-            
-            for paragraph in paragraphs:
-                if current_length + len(paragraph) + 2 <= MAX_CONTENT_SIZE - 100:  # Leave room for ellipsis
-                    truncated.append(paragraph)
-                    current_length += len(paragraph) + 2  # +2 for the newlines
-                else:
-                    break
-            
-            full_text = "\n\n".join(truncated) + "\n\n... (content truncated due to length)"
-        
-        return full_text
+        return "\n\n".join(result)
 
 class ConfluenceClient:
     """Client for accessing and processing Confluence content."""
@@ -543,10 +416,13 @@ class ConfluenceClient:
             "Content-Type": "application/json"
         }
         self.timeout = 30
-        self.cache = {}
-        self.content_cache = {}
         self.spaces = spaces or []
+        
+        # Cache structures
+        self.page_cache = {}
+        self.content_cache = {}
         self.space_pages = {}
+        self.search_cache = {}
         
         # Create a session for connection pooling
         self.session = requests.Session()
@@ -579,8 +455,8 @@ class ConfluenceClient:
     def get_page_by_id(self, page_id, expand=None):
         """Get a specific page by ID."""
         cache_key = f"page_{page_id}_{expand}"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+        if cache_key in self.page_cache:
+            return self.page_cache[cache_key]
         
         try:
             params = {}
@@ -598,7 +474,7 @@ class ConfluenceClient:
             
             if response.status_code == 200:
                 result = response.json()
-                self.cache[cache_key] = result
+                self.page_cache[cache_key] = result
                 return result
             
             logger.error(f"Failed to get page {page_id}: {response.status_code}")
@@ -620,7 +496,9 @@ class ConfluenceClient:
                 return None
             
             # Extract basic metadata
-            space_path = page.get('_expandable', {}).get('space', '').split('/')[-1] if '_expandable' in page else ""
+            space_path = ""
+            if "_expandable" in page and "space" in page["_expandable"]:
+                space_path = page["_expandable"]["space"].split('/')[-1]
             
             metadata = {
                 "id": page.get("id"),
@@ -662,109 +540,121 @@ class ConfluenceClient:
         logger.info(f"Loaded {len(loaded_pages)} critical pages: {', '.join(loaded_pages)}")
         return len(loaded_pages)
     
-    def get_all_pages_in_space(self, space_key, limit=1000):
-        """Get all pages in a Confluence space."""
+    def get_all_pages_in_space(self, space_key, limit=NO_LIMIT):
+        """Get all pages in a Confluence space without arbitrary limits."""
         cache_key = f"space_pages_{space_key}"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+        if space_key in self.space_pages:
+            return self.space_pages[space_key]
         
         try:
             all_pages = []
             start = 0
+            batch_size = 100  # Maximum allowed by Confluence API
             
-            logger.info(f"Fetching pages from space: {space_key}")
+            logger.info(f"Fetching all pages from space: {space_key}")
             
             while True:
-                response = self.session.get(
-                    f"{self.api_url}/content",
-                    auth=self.auth,
-                    headers=self.headers,
-                    params={
-                        "spaceKey": space_key,
-                        "expand": "version",
-                        "limit": 100,
-                        "start": start
-                    },
-                    timeout=self.timeout,
-                    verify=False
-                )
-                
-                if response.status_code != 200:
-                    logger.error(f"Failed to get pages for space {space_key}: {response.status_code}")
+                try:
+                    response = self.session.get(
+                        f"{self.api_url}/content",
+                        auth=self.auth,
+                        headers=self.headers,
+                        params={
+                            "spaceKey": space_key,
+                            "expand": "version",
+                            "limit": batch_size,
+                            "start": start
+                        },
+                        timeout=self.timeout,
+                        verify=False
+                    )
+                    
+                    if response.status_code != 200:
+                        logger.error(f"Failed to get pages for space {space_key}: {response.status_code}")
+                        break
+                    
+                    data = response.json()
+                    results = data.get("results", [])
+                    all_pages.extend(results)
+                    
+                    logger.info(f"Fetched {len(results)} pages from space {space_key}, batch starting at {start}")
+                    
+                    # Check if we've reached the end
+                    if len(results) < batch_size or len(all_pages) >= limit:
+                        break
+                    
+                    start += batch_size
+                    time.sleep(0.1)  # Slight delay to avoid rate limiting
+                    
+                except Exception as e:
+                    logger.error(f"Error in batch fetch for space {space_key} starting at {start}: {str(e)}")
                     break
-                
-                data = response.json()
-                results = data.get("results", [])
-                all_pages.extend(results)
-                
-                if len(results) < 100 or len(all_pages) >= limit:
-                    break
-                
-                start += 100
-                time.sleep(0.2)  # Small delay to avoid rate limiting
             
-            logger.info(f"Loaded {len(all_pages)} pages from space {space_key}")
-            self.cache[cache_key] = all_pages
+            logger.info(f"Total pages loaded from space {space_key}: {len(all_pages)}")
+            self.space_pages[space_key] = all_pages
             return all_pages
             
         except Exception as e:
             logger.error(f"Error getting pages for space {space_key}: {str(e)}")
-            # Return empty list on error
-            self.cache[cache_key] = []
+            self.space_pages[space_key] = []
             return []
     
     def load_all_spaces(self):
-        """Load all pages from configured spaces."""
+        """Load all pages from all configured spaces."""
         total_pages = 0
         for space_key in self.spaces:
             pages = self.get_all_pages_in_space(space_key)
-            self.space_pages[space_key] = pages
             total_pages += len(pages)
-            logger.info(f"Loaded {len(pages)} pages from space {space_key}")
         
         logger.info(f"Total pages loaded from all spaces: {total_pages}")
         return total_pages
     
-    def search_content(self, query, max_results=15):
-        """Search for content across spaces with enhanced relevance scoring."""
-        # First check if we need to load spaces
+    def search_content(self, query, max_results=20):
+        """Search for content across all spaces."""
+        # Create a cache key based on query
+        cache_key = hashlib.md5(query.encode('utf-8')).hexdigest()
+        if cache_key in self.search_cache:
+            return self.search_cache[cache_key]
+        
+        # First ensure all spaces are loaded
         if not self.space_pages:
             self.load_all_spaces()
-        
-        all_candidates = []
         
         # Normalize query for searching
         query_norm = query.lower()
         query_terms = set(re.findall(r'\b\w+\b', query_norm))
         
-        # Search in each space
+        # Search across all spaces
+        all_candidates = []
+        
         for space_key, pages in self.space_pages.items():
             for page in pages:
+                # Look for term matches in title
                 title = page.get("title", "").lower()
+                score = 0
                 
-                # Calculate title match score
-                title_score = 0
+                # Score title matches highly
                 for term in query_terms:
                     if term in title:
-                        title_score += 3
+                        score += 5
                     elif term in title.replace("_", " "):
-                        title_score += 2
+                        score += 3
                 
-                # Add to candidates if title score > 0 or it looks like a relevant page
-                if title_score > 0 or re.search(r'api|view|mapping|copper|endpoint', title, re.IGNORECASE):
-                    # Check if this is an important page for a slight boost
-                    boost = 0
-                    for _, page_info in IMPORTANT_PAGES.items():
-                        if page.get("id") == page_info["id"]:
-                            boost = page_info.get("boost", 0.1)
-                            break
-                    
-                    all_candidates.append((page, title_score + boost, space_key))
+                # Special boost for critical documentation
+                page_id = page.get("id")
+                for _, page_info in IMPORTANT_PAGES.items():
+                    if page_id == page_info["id"]:
+                        score += 3
+                        break
+                
+                # Add pages with high title relevance or any page containing key terms
+                if score > 0 or re.search(r'api|view|mapping|copper|endpoint', title, re.IGNORECASE):
+                    all_candidates.append((page, score, space_key))
         
-        # Sort by score and take top candidates
+        # Sort by score and take top candidates for content analysis
         candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)[:max_results * 2]
         
-        # Get content for candidates in parallel
+        # Get content for candidates in parallel for deeper analysis
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_page = {executor.submit(self.get_page_content, page["id"]): (page, score, space_key) 
@@ -775,44 +665,46 @@ class ConfluenceClient:
                 try:
                     content = future.result()
                     if content:
-                        # Calculate content relevance
-                        relevance = score
+                        # Calculate deeper content relevance
+                        final_score = score
                         page_text = content["formatted"].lower()
                         
-                        # Term frequency score
+                        # Add scores for term frequency in content
                         for term in query_terms:
                             term_count = page_text.count(term)
-                            relevance += min(term_count * 0.1, 5)  # Cap at 5 points per term
+                            final_score += min(term_count * 0.2, 10)  # Cap at 10 points per term
                         
-                        # Exact phrase match bonus
-                        if query_norm in page_text:
-                            relevance += 5
+                        # Bonus for exact phrase match
+                        if len(query_terms) > 1 and query_norm in page_text:
+                            final_score += 10
                         
-                        # Special bonuses for specific content types
-                        if "api" in query_norm and any("api" in e["endpoint"] for e in content["content"].get("api_endpoints", [])):
-                            relevance += 3
+                        # Extra boost for view mapping content
+                        if "view" in query_norm and content["content"].get("view_mappings"):
+                            final_score += 15
                         
-                        if "view" in query_norm and any("view" in m["table_title"].lower() for m in content["content"].get("view_mappings", [])):
-                            relevance += 3
+                        # Extra boost for API endpoint content
+                        if "api" in query_norm and content["content"].get("api_endpoints"):
+                            final_score += 15
                         
-                        # Check if this is an important page
-                        for _, page_info in IMPORTANT_PAGES.items():
-                            if page.get("id") == page_info["id"]:
-                                relevance += page_info.get("boost", 0.1)
-                                break
-                        
-                        results.append((page, content, relevance, space_key))
+                        results.append((page, content, final_score, space_key))
                 except Exception as e:
-                    logger.error(f"Error getting content for page {page['id']}: {str(e)}")
+                    logger.error(f"Error analyzing content for page {page['id']}: {str(e)}")
         
-        # Sort by relevance and limit results
-        results.sort(key=lambda x: x[2], reverse=True)
-        return results[:max_results]
+        # Sort by final score and limit results
+        final_results = sorted(results, key=lambda x: x[2], reverse=True)[:max_results]
+        
+        # Cache the search results
+        self.search_cache[cache_key] = final_results
+        
+        return final_results
     
     def find_view_mapping(self, view_name):
         """Find mapping information for a specific view."""
+        if not view_name:
+            return None
+            
         # Normalize view name
-        view_name = view_name.upper().strip()
+        view_name_norm = view_name.upper().strip()
         
         # First check critical mapping page
         mapping_page_id = IMPORTANT_PAGES.get("view_to_api_mapping", {}).get("id")
@@ -826,7 +718,7 @@ class ConfluenceClient:
                     view_matches = []
                     for entry in mapping.get("mappings", []):
                         view_attr = entry.get("view_attribute", "").upper()
-                        if view_name in view_attr or view_name.replace("_", "") in view_attr.replace("_", ""):
+                        if view_name_norm in view_attr:
                             view_matches.append(entry)
                     
                     if view_matches:
@@ -838,14 +730,14 @@ class ConfluenceClient:
                         }
         
         # Search more broadly
-        search_results = self.search_content(f"{view_name} mapping", max_results=5)
+        search_results = self.search_content(f"{view_name} mapping", max_results=8)
         
         for page, content, score, space_key in search_results:
             for mapping in content["content"].get("view_mappings", []):
                 view_matches = []
                 for entry in mapping.get("mappings", []):
                     view_attr = entry.get("view_attribute", "").upper()
-                    if view_name in view_attr or view_name.replace("_", "") in view_attr.replace("_", ""):
+                    if view_name_norm in view_attr:
                         view_matches.append(entry)
                 
                 if view_matches:
@@ -857,24 +749,26 @@ class ConfluenceClient:
                         "page_title": page['title']
                     }
         
-        # If exact view mapping not found, look for similar views
-        logger.info(f"No exact mapping found for {view_name}, searching for similar views")
-        similar_search = self.search_content(f"view mapping", max_results=8)
+        # If exact view mapping not found, collect similar views for reference
+        similar_search = self.search_content("view mapping", max_results=10)
         
         all_mappings = []
         for page, content, score, space_key in similar_search:
-            for mapping in content["content"].get("view_mappings", []):
+            if content["content"].get("view_mappings"):
                 all_mappings.append({
-                    "mappings": mapping.get("mappings", []),
+                    "mappings": content["content"]["view_mappings"],
                     "page_id": page['id'],
                     "page_title": page['title']
                 })
         
-        return {
-            "source": "similar_mappings",
-            "view_name": view_name,
-            "similar_mappings": all_mappings
-        }
+        if all_mappings:
+            return {
+                "source": "similar_mappings",
+                "view_name": view_name,
+                "similar_mappings": all_mappings
+            }
+        
+        return None
 
 class StashClient:
     """Client for interacting with Bitbucket (Stash) repositories."""
@@ -891,12 +785,14 @@ class StashClient:
         if api_token:
             self.headers["Authorization"] = f"Bearer {api_token}"
         
+        # Session for connection pooling
         self.session = requests.Session()
-        self.cache = {}
         
-        logger.info(f"Initialized Stash client for {base_url}")
+        # Caches
+        self.file_cache = {}
+        self.file_list_cache = None
         
-        # Mock SQL storage for fallback
+        # Mock SQL store for fallback/demonstration
         self.mock_sql_store = {
             "W_CORE_TCC_SPAN_MAPPING": """
             CREATE OR REPLACE VIEW W_CORE_TCC_SPAN_MAPPING AS 
@@ -968,6 +864,8 @@ class StashClient:
             JOIN INSTRUMENT_MASTER INSTRUMENT ON TRADE.INSTRUMENT_ID = INSTRUMENT.INSTRUMENT_ID
             """
         }
+        
+        logger.info(f"Initialized Stash client for {base_url}")
     
     def test_connection(self):
         """Test connection to Stash API."""
@@ -986,11 +884,10 @@ class StashClient:
                 return True
             
             logger.warning(f"Stash connection warning: {response.status_code}")
-            # Even if we get an error, we'll continue with mock data if needed
             return False
             
         except Exception as e:
-            logger.warning(f"Stash connection error (will use mock data): {str(e)}")
+            logger.warning(f"Stash connection error: {str(e)}")
             return False
     
     def get_file_content(self, filename):
@@ -998,15 +895,16 @@ class StashClient:
         if not filename:
             return None
         
-        cache_key = f"file_{filename}"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+        # Check cache first
+        if filename in self.file_cache:
+            return self.file_cache[filename]
+        
+        # Normalize filename
+        if not filename.endswith('.sql'):
+            filename = f"{filename}.sql"
         
         try:
             # Form the file path
-            if not filename.endswith('.sql'):
-                filename = f"{filename}.sql"
-            
             file_path = f"{self.directory_path}/{filename}"
             url = f"{self.base_url}/rest/api/1.0/projects/{self.project_key}/repos/{self.repo_slug}/raw/{file_path}"
             
@@ -1021,17 +919,17 @@ class StashClient:
             
             if response.status_code == 200:
                 content = response.text
-                self.cache[cache_key] = content
+                self.file_cache[filename] = content
                 return content
             
-            logger.warning(f"Failed to get file {filename}: {response.status_code} - Will try mock data")
+            logger.warning(f"Failed to get file {filename}: {response.status_code}")
             
             # Check mock store if real API failed
-            view_name = filename.split('/')[-1].split('.')[0].upper()
-            if view_name in self.mock_sql_store:
-                mock_sql = self.mock_sql_store[view_name]
-                logger.info(f"Found mock SQL for {view_name}")
-                self.cache[cache_key] = mock_sql
+            base_name = filename.split('/')[-1].split('.')[0].upper()
+            if base_name in self.mock_sql_store:
+                logger.info(f"Using mock SQL for {base_name}")
+                mock_sql = self.mock_sql_store[base_name]
+                self.file_cache[filename] = mock_sql
                 return mock_sql
             
             return None
@@ -1039,21 +937,20 @@ class StashClient:
         except Exception as e:
             logger.error(f"Error getting file {filename}: {str(e)}")
             
-            # Try mock data as fallback
-            view_name = filename.split('/')[-1].split('.')[0].upper()
-            if view_name in self.mock_sql_store:
-                mock_sql = self.mock_sql_store[view_name]
-                logger.info(f"Using mock SQL for {view_name} after error")
-                self.cache[cache_key] = mock_sql
+            # Use mock data as fallback
+            base_name = filename.split('/')[-1].split('.')[0].upper()
+            if base_name in self.mock_sql_store:
+                logger.info(f"Using mock SQL for {base_name} after error")
+                mock_sql = self.mock_sql_store[base_name]
+                self.file_cache[filename] = mock_sql
                 return mock_sql
                 
             return None
     
-    def list_files(self):
+    def list_files(self, force_refresh=False):
         """List all SQL files in the directory."""
-        cache_key = "file_list"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+        if self.file_list_cache is not None and not force_refresh:
+            return self.file_list_cache
         
         try:
             url = f"{self.base_url}/rest/api/1.0/projects/{self.project_key}/repos/{self.repo_slug}/files/{self.directory_path}"
@@ -1068,21 +965,21 @@ class StashClient:
             if response.status_code == 200:
                 files = response.json()
                 sql_files = [f for f in files if f.endswith('.sql')]
-                self.cache[cache_key] = sql_files
+                self.file_list_cache = sql_files
                 logger.info(f"Found {len(sql_files)} SQL files")
                 return sql_files
             
-            # If the API fails, use mock files
-            logger.warning(f"Failed to list files: {response.status_code} - Using mock list")
-            mock_files = list(f"{name}.sql" for name in self.mock_sql_store.keys())
-            self.cache[cache_key] = mock_files
+            # If API fails, use mock data
+            logger.warning(f"Failed to list files: {response.status_code}")
+            mock_files = [f"{name}.sql" for name in self.mock_sql_store.keys()]
+            self.file_list_cache = mock_files
             return mock_files
             
         except Exception as e:
             logger.error(f"Error listing files: {str(e)}")
-            # Return mock files for demonstration
-            mock_files = list(f"{name}.sql" for name in self.mock_sql_store.keys())
-            self.cache[cache_key] = mock_files
+            # Return mock files as fallback
+            mock_files = [f"{name}.sql" for name in self.mock_sql_store.keys()]
+            self.file_list_cache = mock_files
             return mock_files
     
     def get_view_sql(self, view_name):
@@ -1093,7 +990,7 @@ class StashClient:
         # Normalize view name
         view_name = view_name.upper().strip()
         
-        # Try direct access first
+        # Check mock store first
         if view_name in self.mock_sql_store:
             logger.info(f"Found view {view_name} in mock store")
             return self.mock_sql_store[view_name]
@@ -1116,7 +1013,7 @@ class StashClient:
             if base_name == view_name:
                 return self.get_file_content(filename)
             
-            # Also check similar names
+            # Also check similar names (without underscores)
             if base_name.replace("_", "") == view_name.replace("_", ""):
                 return self.get_file_content(filename)
         
@@ -1127,7 +1024,7 @@ class StashClient:
                                     content, re.IGNORECASE):
                 return content
         
-        logger.warning(f"SQL not found for view: {view_name} - will generate generic SQL")
+        logger.warning(f"SQL not found for view: {view_name} - generating generic SQL")
         
         # Generate generic SQL if nothing found
         generic_sql = f"""
@@ -1169,39 +1066,168 @@ class SQLParser:
                                        sql_text, re.IGNORECASE)
             view_name = view_name_match.group(1) if view_name_match else "UnknownView"
             
-            # Parse SQL with sqlparse
-            parsed = sqlparse.parse(sql_text)
-            if not parsed:
-                return {
-                    "view_name": view_name,
-                    "columns": [],
-                    "tables": [],
-                    "joins": [],
-                    "where_clauses": [],
-                    "sql_text": sql_text
-                }
+            # Extract columns from SELECT clause
+            columns = []
+            select_match = re.search(r'SELECT\s+(.*?)\s+FROM', sql_text, re.IGNORECASE | re.DOTALL)
+            if select_match:
+                select_clause = select_match.group(1)
                 
-            statement = parsed[0]
+                # Handle SELECT *
+                if '*' in select_clause:
+                    columns.append({
+                        "name": "*",
+                        "alias": None,
+                        "table": None
+                    })
+                else:
+                    # Split by comma but respect parentheses
+                    column_expressions = []
+                    current_expr = ""
+                    paren_level = 0
+                    
+                    for char in select_clause:
+                        if char == '(':
+                            paren_level += 1
+                        elif char == ')':
+                            paren_level -= 1
+                        
+                        if char == ',' and paren_level == 0:
+                            column_expressions.append(current_expr.strip())
+                            current_expr = ""
+                        else:
+                            current_expr += char
+                    
+                    if current_expr.strip():
+                        column_expressions.append(current_expr.strip())
+                    
+                    # Process each column
+                    for expr in column_expressions:
+                        # Check for AS keyword
+                        as_match = re.search(r'(.*?)\s+AS\s+([A-Za-z0-9_]+)\s*$', expr, re.IGNORECASE)
+                        if as_match:
+                            col_expr = as_match.group(1).strip()
+                            alias = as_match.group(2).strip()
+                            
+                            # Check if table.column format
+                            if '.' in col_expr and not '(' in col_expr:
+                                parts = col_expr.split('.')
+                                table = parts[0].strip()
+                                name = parts[1].strip()
+                                columns.append({
+                                    "name": name,
+                                    "alias": alias,
+                                    "table": table,
+                                    "expression": expr
+                                })
+                            else:
+                                columns.append({
+                                    "name": col_expr,
+                                    "alias": alias,
+                                    "table": None,
+                                    "expression": expr
+                                })
+                        else:
+                            # No AS keyword - check for implicit alias
+                            if re.search(r'[A-Za-z0-9_.]+\s+[A-Za-z0-9_]+\s*$', expr) and not '(' in expr:
+                                parts = expr.split()
+                                col_expr = ' '.join(parts[:-1])
+                                alias = parts[-1]
+                                
+                                if '.' in col_expr:
+                                    table_col = col_expr.split('.')
+                                    table = table_col[0].strip()
+                                    name = table_col[1].strip()
+                                    columns.append({
+                                        "name": name,
+                                        "alias": alias,
+                                        "table": table,
+                                        "expression": expr
+                                    })
+                                else:
+                                    columns.append({
+                                        "name": col_expr,
+                                        "alias": alias,
+                                        "table": None,
+                                        "expression": expr
+                                    })
+                            else:
+                                # Simple column reference
+                                if '.' in expr:
+                                    parts = expr.split('.')
+                                    table = parts[0].strip()
+                                    name = parts[1].strip()
+                                    columns.append({
+                                        "name": name,
+                                        "alias": None,
+                                        "table": table,
+                                        "expression": expr
+                                    })
+                                else:
+                                    columns.append({
+                                        "name": expr,
+                                        "alias": None,
+                                        "table": None,
+                                        "expression": expr
+                                    })
             
-            # Extract all identifiers and from the SQL to help with analysis
-            identifiers = [token for token in statement.flatten() 
-                          if isinstance(token, sqlparse.sql.Identifier)]
+            # Extract tables from FROM/JOIN clauses
+            tables = []
+            joins = []
+            from_match = re.search(r'FROM\s+(.*?)(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|$)', 
+                                  sql_text, re.IGNORECASE | re.DOTALL)
             
-            # Extract columns, tables and join conditions with improved regex patterns
-            columns = SQLParser.extract_columns(sql_text)
-            tables = SQLParser.extract_tables(sql_text)
-            joins = SQLParser.extract_joins(sql_text)
-            where_clauses = SQLParser.extract_where_clauses(sql_text)
+            if from_match:
+                from_clause = from_match.group(1)
+                
+                # Extract main table first
+                main_table_match = re.search(r'^\s*([A-Za-z0-9_."]+)(?:\s+(?:AS\s+)?([A-Za-z0-9_]+))?', 
+                                           from_clause, re.IGNORECASE)
+                if main_table_match:
+                    table_name = main_table_match.group(1).strip('"')
+                    alias = main_table_match.group(2) if main_table_match.group(2) else None
+                    
+                    tables.append({
+                        "name": table_name,
+                        "alias": alias,
+                        "join_type": "FROM"
+                    })
+                
+                # Extract joins
+                join_pattern = r'(INNER|LEFT|RIGHT|FULL|CROSS)?\s*JOIN\s+([A-Za-z0-9_."]+)(?:\s+(?:AS\s+)?([A-Za-z0-9_]+))?\s+ON\s+(.+?)(?=\s+(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*JOIN|\s+WHERE|\s*$)'
+                join_matches = re.finditer(join_pattern, from_clause, re.IGNORECASE | re.DOTALL)
+                
+                for match in join_matches:
+                    join_type = match.group(1) if match.group(1) else "INNER"
+                    table_name = match.group(2).strip('"')
+                    alias = match.group(3) if match.group(3) else None
+                    condition = match.group(4).strip()
+                    
+                    tables.append({
+                        "name": table_name,
+                        "alias": alias,
+                        "join_type": f"{join_type} JOIN"
+                    })
+                    
+                    joins.append({
+                        "type": join_type,
+                        "table": table_name,
+                        "alias": alias,
+                        "condition": condition
+                    })
             
-            # Add source information to columns by analyzing table aliases
-            for column in columns:
-                if column.get("table") and not column.get("source_table"):
-                    # Find the actual table for this alias
-                    alias = column["table"]
-                    for table in tables:
-                        if table.get("alias") == alias:
-                            column["source_table"] = table["name"]
-                            break
+            # Extract WHERE clauses
+            where_clauses = []
+            where_match = re.search(r'WHERE\s+(.*?)(?:GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|$)', 
+                                   sql_text, re.IGNORECASE | re.DOTALL)
+            
+            if where_match:
+                where_clause = where_match.group(1)
+                # Split on AND (simplified approach)
+                conditions = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
+                for condition in conditions:
+                    condition = condition.strip()
+                    if condition:
+                        where_clauses.append(condition)
             
             return {
                 "view_name": view_name,
@@ -1215,7 +1241,7 @@ class SQLParser:
         except Exception as e:
             logger.error(f"Error parsing SQL: {str(e)}")
             return {
-                "view_name": "ErrorView",
+                "view_name": view_name if 'view_name' in locals() else "ErrorView",
                 "columns": [],
                 "tables": [],
                 "joins": [],
@@ -1225,360 +1251,44 @@ class SQLParser:
             }
     
     @staticmethod
-    def extract_columns(sql_text):
-        """Extract columns from SQL SELECT statement."""
-        columns = []
-        
-        # Find the SELECT clause
-        select_match = re.search(r'SELECT\s+(.*?)\s+FROM', sql_text, re.IGNORECASE | re.DOTALL)
-        if not select_match:
-            return columns
-            
-        select_clause = select_match.group(1)
-        
-        # Handle SELECT *
-        if '*' in select_clause:
-            columns.append({
-                "name": "*",
-                "alias": None,
-                "table": None,
-                "source_table": None,
-                "expression": "*"
-            })
-            return columns
-        
-        # Split by comma while respecting parentheses
-        column_expressions = []
-        current_expr = ""
-        paren_level = 0
-        
-        for char in select_clause:
-            if char == '(':
-                paren_level += 1
-            elif char == ')':
-                paren_level -= 1
-            
-            if char == ',' and paren_level == 0:
-                column_expressions.append(current_expr.strip())
-                current_expr = ""
-            else:
-                current_expr += char
-        
-        if current_expr.strip():
-            column_expressions.append(current_expr.strip())
-        
-        # Process each column expression
-        for expr in column_expressions:
-            # Check for column AS alias format
-            as_match = re.search(r'(.*?)\s+AS\s+([A-Za-z0-9_]+)\s*$', expr, re.IGNORECASE)
-            if as_match:
-                col_expr = as_match.group(1).strip()
-                alias = as_match.group(2).strip()
-                
-                # Check if it's a simple column or an expression
-                if re.match(r'^[A-Za-z0-9_.]+$', col_expr):
-                    # Simple column reference
-                    if '.' in col_expr:
-                        table, name = col_expr.split('.', 1)
-                        columns.append({
-                            "name": name,
-                            "alias": alias,
-                            "table": table,
-                            "source_table": None,
-                            "expression": expr
-                        })
-                    else:
-                        columns.append({
-                            "name": col_expr,
-                            "alias": alias,
-                            "table": None,
-                            "source_table": None,
-                            "expression": expr
-                        })
-                else:
-                    # Expression
-                    columns.append({
-                        "name": col_expr,
-                        "alias": alias,
-                        "table": None,
-                        "source_table": None,
-                        "expression": expr,
-                        "is_expression": True
-                    })
-            else:
-                # No AS keyword - check for implicit alias or simple column reference
-                implicit_alias_match = re.search(r'(.*?)\s+([A-Za-z0-9_]+)\s*$', expr)
-                if implicit_alias_match and '(' in implicit_alias_match.group(1):
-                    # Likely an expression with implicit alias
-                    col_expr = implicit_alias_match.group(1).strip()
-                    alias = implicit_alias_match.group(2).strip()
-                    columns.append({
-                        "name": col_expr,
-                        "alias": alias,
-                        "table": None,
-                        "source_table": None,
-                        "expression": expr,
-                        "is_expression": True
-                    })
-                else:
-                    # Simple column reference
-                    if '.' in expr:
-                        table, name = expr.split('.', 1)
-                        columns.append({
-                            "name": name,
-                            "alias": None,
-                            "table": table,
-                            "source_table": None,
-                            "expression": expr
-                        })
-                    else:
-                        columns.append({
-                            "name": expr,
-                            "alias": None,
-                            "table": None,
-                            "source_table": None,
-                            "expression": expr
-                        })
-        
-        return columns
-    
-    @staticmethod
-    def extract_tables(sql_text):
-        """Extract tables from SQL FROM clause."""
-        tables = []
-        
-        # Find FROM clause
-        from_match = re.search(r'FROM\s+(.*?)(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|$)', 
-                              sql_text, re.IGNORECASE | re.DOTALL)
-        if not from_match:
-            return tables
-            
-        from_clause = from_match.group(1)
-        
-        # Extract main table (first in FROM clause)
-        main_table_match = re.search(r'^\s*([A-Za-z0-9_."]+)(?:\s+(?:AS\s+)?([A-Za-z0-9_]+))?', 
-                                    from_clause, re.IGNORECASE)
-        if main_table_match:
-            table_name = main_table_match.group(1).strip('"')
-            alias = main_table_match.group(2) if main_table_match.group(2) else None
-            
-            tables.append({
-                "name": table_name,
-                "alias": alias,
-                "join_type": "FROM"
-            })
-        
-        # Extract tables from JOIN clauses
-        join_pattern = r'(INNER|LEFT|RIGHT|FULL|CROSS)?\s*JOIN\s+([A-Za-z0-9_."]+)(?:\s+(?:AS\s+)?([A-Za-z0-9_]+))?'
-        join_matches = re.finditer(join_pattern, from_clause, re.IGNORECASE)
-        
-        for match in join_matches:
-            join_type = match.group(1) if match.group(1) else "INNER"
-            table_name = match.group(2).strip('"')
-            alias = match.group(3) if match.group(3) else None
-            
-            tables.append({
-                "name": table_name,
-                "alias": alias,
-                "join_type": f"{join_type} JOIN"
-            })
-        
-        return tables
-    
-    @staticmethod
-    def extract_joins(sql_text):
-        """Extract join conditions from SQL."""
-        joins = []
-        
-        # Find FROM clause
-        from_match = re.search(r'FROM\s+(.*?)(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|$)', 
-                              sql_text, re.IGNORECASE | re.DOTALL)
-        if not from_match:
-            return joins
-            
-        from_clause = from_match.group(1)
-        
-        # Extract JOIN conditions
-        join_pattern = r'(INNER|LEFT|RIGHT|FULL|CROSS)?\s*JOIN\s+([A-Za-z0-9_."]+)(?:\s+(?:AS\s+)?([A-Za-z0-9_]+))?\s+ON\s+(.+?)(?=\s+(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*JOIN|\s+WHERE|\s*$)'
-        join_matches = re.finditer(join_pattern, from_clause, re.IGNORECASE | re.DOTALL)
-        
-        for match in join_matches:
-            join_type = match.group(1) if match.group(1) else "INNER"
-            table_name = match.group(2).strip('"')
-            alias = match.group(3) if match.group(3) else None
-            condition = match.group(4).strip()
-            
-            # Analyze join condition to extract relationships
-            join_fields = SQLParser.analyze_join_condition(condition)
-            
-            joins.append({
-                "type": join_type,
-                "table": table_name,
-                "alias": alias,
-                "condition": condition,
-                "fields": join_fields
-            })
-        
-        return joins
-    
-    @staticmethod
-    def analyze_join_condition(condition):
-        """Analyze a join condition to extract field relationships."""
-        fields = {
-            "left": [],
-            "right": [],
-            "operator": "="
-        }
-        
-        # Split by AND if multiple conditions
-        subconditions = re.split(r'\s+AND\s+', condition, flags=re.IGNORECASE)
-        
-        for subcond in subconditions:
-            # Look for a.field = b.field pattern
-            parts = re.split(r'\s*(=|<>|!=|>|<|>=|<=)\s*', subcond.strip())
-            
-            if len(parts) >= 3:
-                left = parts[0].strip()
-                operator = parts[1].strip()
-                right = parts[2].strip()
-                
-                fields["left"].append(left)
-                fields["right"].append(right)
-                fields["operator"] = operator
-        
-        return fields
-    
-    @staticmethod
-    def extract_where_clauses(sql_text):
-        """Extract conditions from WHERE clause."""
-        where_clauses = []
-        
-        # Find WHERE clause
-        where_match = re.search(r'WHERE\s+(.*?)(?:GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|$)', 
-                               sql_text, re.IGNORECASE | re.DOTALL)
-        if not where_match:
-            return where_clauses
-            
-        where_clause = where_match.group(1)
-        
-        # Split on AND/OR (simplified approach)
-        and_conditions = re.split(r'\s+AND\s+', where_clause, flags=re.IGNORECASE)
-        
-        for and_condition in and_conditions:
-            or_conditions = re.split(r'\s+OR\s+', and_condition, flags=re.IGNORECASE)
-            for condition in or_conditions:
-                condition = condition.strip()
-                if condition:
-                    # Parse the condition to extract field, operator, value
-                    parts = re.split(r'\s*(=|<>|!=|>|<|>=|<=|IN|NOT\s+IN|LIKE|NOT\s+LIKE|IS|IS\s+NOT)\s*', 
-                                    condition, flags=re.IGNORECASE, maxsplit=1)
-                    
-                    if len(parts) >= 3:
-                        field = parts[0].strip()
-                        operator = parts[1].strip()
-                        value = parts[2].strip()
-                        
-                        where_clauses.append({
-                            "field": field,
-                            "operator": operator,
-                            "value": value,
-                            "condition": condition
-                        })
-                    else:
-                        where_clauses.append({
-                            "condition": condition
-                        })
-        
-        return where_clauses
-    
-    @staticmethod
     def categorize_columns(parsed_view):
-        """Categorize columns by purpose based on naming patterns."""
-        if not parsed_view or "columns" not in parsed_view:
-            return []
-        
+        """Categorize columns by purpose and data type."""
         categorized = []
-        table_analysis = {}
         
-        # First analyze tables to understand their roles
-        for table in parsed_view.get("tables", []):
-            table_name = table.get("name", "").lower()
-            alias = table.get("alias")
-            role = "unknown"
-            
-            # Detect common table types based on naming
-            if re.search(r'product|prod', table_name):
-                role = "product"
-            elif re.search(r'instrument|inst', table_name):
-                role = "instrument"
-            elif re.search(r'trad|trade', table_name):
-                role = "trade"
-            elif re.search(r'firm|group', table_name):
-                role = "firm"
-            elif re.search(r'user|account', table_name):
-                role = "user"
-            elif re.search(r'currency|curr', table_name):
-                role = "currency"
-            elif re.search(r'exchange|exch', table_name):
-                role = "exchange"
-            
-            if alias:
-                table_analysis[alias.lower()] = role
-            table_analysis[table_name] = role
+        if not parsed_view or "columns" not in parsed_view:
+            return categorized
         
-        # Now categorize columns
-        for column in parsed_view.get("columns", []):
+        for column in parsed_view["columns"]:
             category = "unknown"
             name = column.get("name", "").lower()
-            alias = column.get("alias", "").lower() if column.get("alias") else ""
+            alias = column.get("alias", "").lower() if column.get("alias") else name
             display_name = alias or name
-            table = column.get("table", "").lower()
-            purpose = ""
             data_type = "string"
             
-            # Determine category by name patterns
+            # Determine category based on naming patterns
             if re.search(r'id$|guid$|key$', display_name):
                 category = "identifier"
                 data_type = "string"
-                purpose = "Unique identifier"
             elif re.search(r'date$|time$|timestamp$', display_name):
                 category = "datetime"
                 data_type = "timestamp"
-                purpose = "Date/time value"
             elif re.search(r'amt$|amount$|sum$|total$|price$|qty$|quantity$', display_name):
                 category = "numeric"
                 data_type = "number"
-                purpose = "Numeric value"
             elif re.search(r'name$|desc|description$|label$|title$', display_name):
                 category = "descriptive"
                 data_type = "string"
-                purpose = "Descriptive text"
             elif re.search(r'flag$|indicator$|status$|type$|category$|code$', display_name):
                 category = "code"
                 data_type = "string"
-                purpose = "Code or status value"
             elif re.search(r'currency$|curr$', display_name):
                 category = "currency"
                 data_type = "string"
-                purpose = "Currency code"
             
-            # Refine purpose based on table role
-            if table and table in table_analysis:
-                table_role = table_analysis[table]
-                if table_role != "unknown":
-                    if category == "identifier":
-                        purpose = f"{table_role.capitalize()} identifier"
-                    elif category == "descriptive":
-                        purpose = f"{table_role.capitalize()} description"
-                    elif category == "code":
-                        purpose = f"{table_role.capitalize()} code or type"
-            
-            # Add categorization
             categorized.append({
                 "column": column,
                 "category": category,
-                "data_type": data_type,
-                "purpose": purpose
+                "data_type": data_type
             })
         
         return categorized
@@ -1594,9 +1304,9 @@ class MappingGenerator:
         self.sql_parser = SQLParser()
         self.mapping_cache = {}
         
-        # Load common mapping patterns
+        # Common mapping patterns
         self.mapping_patterns = {
-            # Column suffix to API field patterns
+            # Field suffix → API field patterns
             "ID": "id",
             "GUID": "guid",
             "CODE": "code",
@@ -1612,7 +1322,7 @@ class MappingGenerator:
             "TYPE": "type"
         }
         
-        # API endpoint patterns based on domain
+        # API endpoint patterns
         self.endpoint_patterns = {
             "product": "/v1/products",
             "instrument": "/v1/instruments",
@@ -1620,7 +1330,9 @@ class MappingGenerator:
             "session": "/v1/sessions",
             "firm": "/v1/firms",
             "user": "/v1/users",
-            "exchange": "/v1/exchanges"
+            "exchange": "/v1/exchanges",
+            "tcc": "/v1/tcc",  # For TCC_SPAN_MAPPING
+            "ticket": "/v1/tickets"
         }
         
         logger.info("Initialized Mapping Generator")
@@ -1640,9 +1352,7 @@ class MappingGenerator:
                 return None
         
         # Generate a cache key based on input
-        cache_key = hashlib.md5((view_name or "") + (sql_text or "")).hexdigest().encode('utf-8')
-        cache_key = cache_key.decode('utf-8')
-        
+        cache_key = hashlib.md5((view_name or "") + (sql_text or "")).hexdigest()
         if cache_key in self.mapping_cache:
             return self.mapping_cache[cache_key]
         
@@ -1655,10 +1365,13 @@ class MappingGenerator:
         # Use view name from SQL if not provided
         if not view_name:
             view_name = parsed_view["view_name"]
+        else:
+            # Ensure view name consistency
+            parsed_view["view_name"] = view_name
         
         # Multi-strategy approach to generate mapping:
         # 1. Try to find mapping in Confluence documentation
-        # 2. If not found or incomplete, use pattern-based mapping
+        # 2. If incomplete, augment with pattern-based mapping
         # 3. If still insufficient, use AI-based mapping
         
         # Strategy 1: Documentation-based mapping
@@ -1667,6 +1380,8 @@ class MappingGenerator:
         if doc_mapping and doc_mapping.get("source") != "similar_mappings" and doc_mapping.get("mappings"):
             logger.info(f"Found mapping in documentation for {view_name}")
             mapping_result = self.format_doc_mapping(doc_mapping, parsed_view)
+            
+            # Cache and return
             self.mapping_cache[cache_key] = mapping_result
             return mapping_result
         
@@ -1674,8 +1389,8 @@ class MappingGenerator:
         logger.info(f"Generating pattern-based mapping for {view_name}")
         pattern_mapping = self.generate_pattern_mapping(parsed_view)
         
-        # Strategy 3: If pattern mapping has few results, use AI-based mapping
-        if len(pattern_mapping.get("attribute_mappings", [])) < len(parsed_view.get("columns", [])) / 2:
+        # Strategy 3: If pattern mapping is insufficient, use AI-based mapping
+        if len(pattern_mapping.get("attribute_mappings", [])) < len(parsed_view.get("columns", [])) * 0.6:
             logger.info(f"Pattern mapping insufficient, using AI for {view_name}")
             ai_mapping = self.generate_ai_mapping(parsed_view, doc_mapping)
             mapping_result = ai_mapping
@@ -1738,8 +1453,8 @@ class MappingGenerator:
             })
         
         # Generate sample request and response bodies
-        result["request_body"] = self.generate_request_body(result["attribute_mappings"], parsed_view)
-        result["response_body"] = self.generate_response_body(result["attribute_mappings"], parsed_view)
+        result["request_body"] = self.generate_request_body(result["attribute_mappings"])
+        result["response_body"] = self.generate_response_body(result["attribute_mappings"])
         
         return result
     
@@ -1777,35 +1492,17 @@ class MappingGenerator:
             # Convert to camelCase for API attribute
             api_attr = self.to_camel_case(display_name)
             
-            # Fine-tune API attribute based on category
+            # Special handling based on category
             if category == "identifier":
                 if display_name.upper().endswith("_ID"):
                     base_name = re.sub(r'_ID$', '', display_name, flags=re.IGNORECASE)
                     api_attr = self.to_camel_case(f"{base_name}Id")
-                elif display_name.upper().endswith("ID"):
-                    api_attr = self.to_camel_case(display_name)
             elif category == "datetime":
                 if display_name.upper().endswith("_DATE"):
                     base_name = re.sub(r'_DATE$', '', display_name, flags=re.IGNORECASE)
                     api_attr = self.to_camel_case(f"{base_name}Date")
-                elif display_name.upper().endswith("_TIME"):
-                    base_name = re.sub(r'_TIME$', '', display_name, flags=re.IGNORECASE)
-                    api_attr = self.to_camel_case(f"{base_name}Time")
-                elif display_name.upper().endswith("_TIMESTAMP"):
-                    base_name = re.sub(r'_TIMESTAMP$', '', display_name, flags=re.IGNORECASE)
-                    api_attr = self.to_camel_case(f"{base_name}Timestamp")
-            elif category == "code":
-                if display_name.upper().endswith("_CODE"):
-                    base_name = re.sub(r'_CODE$', '', display_name, flags=re.IGNORECASE)
-                    api_attr = self.to_camel_case(f"{base_name}Code")
-                elif display_name.upper().endswith("_TYPE"):
-                    base_name = re.sub(r'_TYPE$', '', display_name, flags=re.IGNORECASE)
-                    api_attr = self.to_camel_case(f"{base_name}Type")
-                elif display_name.upper().endswith("_STATUS"):
-                    base_name = re.sub(r'_STATUS$', '', display_name, flags=re.IGNORECASE)
-                    api_attr = self.to_camel_case(f"{base_name}Status")
             
-            # Check for column name patterns that map to standard API fields
+            # Check for column name patterns
             for suffix, api_pattern in self.mapping_patterns.items():
                 if display_name.upper().endswith(suffix):
                     base_name = re.sub(f"{suffix}$", "", display_name, flags=re.IGNORECASE)
@@ -1819,12 +1516,12 @@ class MappingGenerator:
             result["attribute_mappings"].append({
                 "view_attribute": display_name,
                 "api_attribute": api_attr,
-                "notes": f"Category: {category}, Purpose: {cat_col.get('purpose', 'Unknown')}"
+                "notes": f"Category: {category}, Data type: {cat_col.get('data_type', 'string')}"
             })
         
         # Generate sample request and response bodies
-        result["request_body"] = self.generate_request_body(result["attribute_mappings"], parsed_view)
-        result["response_body"] = self.generate_response_body(result["attribute_mappings"], parsed_view)
+        result["request_body"] = self.generate_request_body(result["attribute_mappings"])
+        result["response_body"] = self.generate_response_body(result["attribute_mappings"])
         
         return result
     
@@ -1851,8 +1548,9 @@ class MappingGenerator:
                 doc_context = "Here are mappings for similar views that might help:\n"
                 for i, mapping in enumerate(doc_mapping.get("similar_mappings", [])):
                     doc_context += f"Similar mapping {i+1} from {mapping.get('page_title', 'Unknown')}:\n"
-                    for item in mapping.get("mappings", []):
-                        doc_context += f"- View: {item.get('view_attribute', '')} → API: {item.get('api_attribute', '')}\n"
+                    for m in mapping.get("mappings", []):
+                        for item in m.get("mappings", []):
+                            doc_context += f"- View: {item.get('view_attribute', '')} → API: {item.get('api_attribute', '')}\n"
                     doc_context += "\n"
             else:
                 doc_context = "Partial documentation mapping found:\n"
@@ -1968,30 +1666,12 @@ class MappingGenerator:
                 if page_content:
                     # Extract relevant sections
                     content_text = page_content["formatted"]
-                    # Limit size for each page to ensure we can fit multiple pages
+                    # Limit size for each page
                     if len(content_text) > 2000:
                         content_text = content_text[:2000] + "..."
                     context.append(f"## {page_info['title']}\n{content_text}")
         
-        # Combine all context
-        full_context = "\n\n".join(context)
-        
-        # Ensure it's not too large
-        if len(full_context) > MAX_CONTENT_SIZE // 2:  # Use at most half of the max size
-            paragraphs = full_context.split("\n\n")
-            truncated = []
-            current_length = 0
-            
-            for paragraph in paragraphs:
-                if current_length + len(paragraph) + 2 <= MAX_CONTENT_SIZE // 2 - 100:
-                    truncated.append(paragraph)
-                    current_length += len(paragraph) + 2
-                else:
-                    break
-            
-            full_context = "\n\n".join(truncated) + "\n\n... (content truncated due to length)"
-        
-        return full_context
+        return "\n\n".join(context)
     
     def infer_endpoint_from_view(self, parsed_view):
         """Infer API endpoint from view name and structure."""
@@ -2001,7 +1681,7 @@ class MappingGenerator:
         domain = None
         
         # Look for common domain patterns in view name
-        for key, pattern in self.endpoint_patterns.items():
+        for key, _ in self.endpoint_patterns.items():
             if key.upper() in view_name:
                 domain = key
                 break
@@ -2032,24 +1712,20 @@ class MappingGenerator:
         
         # Default: Extract from view name
         clean_name = re.sub(r'^(W_|STATIC_VW_)', '', view_name)
-        endpoint_base = re.sub(r'_', '-', clean_name.lower())
+        parts = clean_name.split('_')
         
-        # Normalize endpoint path
-        parts = endpoint_base.split('-')
-        if len(parts) > 1:
-            # Use the most meaningful part as the resource name
-            resource = None
-            for part in parts:
-                if part in ['core', 'static', 'vw']:
-                    continue
-                if resource is None or len(part) > len(resource):
-                    resource = part
-            
-            if resource:
-                return f"/v1/{resource}s"
+        # Look for meaningful resource name
+        resource = None
+        for part in parts:
+            if part.lower() not in ['core', 'static', 'vw']:
+                resource = part.lower()
+                break
         
-        # Fallback to full endpoint
-        return f"/v1/{endpoint_base}"
+        if resource:
+            return f"/v1/{resource}s"
+        
+        # Fallback
+        return f"/v1/{clean_name.lower()}"
     
     def to_camel_case(self, snake_case):
         """Convert snake_case or UPPER_CASE to camelCase."""
@@ -2068,131 +1744,60 @@ class MappingGenerator:
         components = clean_str.split('_')
         return components[0].lower() + ''.join(x.title() for x in components[1:] if x)
     
-    def generate_request_body(self, attribute_mappings, parsed_view=None):
+    def generate_request_body(self, attribute_mappings):
         """Generate a sample request body based on attribute mappings."""
         body = {}
         
-        # Group attributes by parent object
-        attribute_groups = {}
-        
+        # Process attribute mappings
         for mapping in attribute_mappings:
             api_attr = mapping.get("api_attribute", "")
+            view_attr = mapping.get("view_attribute", "")
             
-            # Skip if empty or contains special characters
-            if not api_attr or not re.match(r'^[a-zA-Z0-9_.]+$', api_attr):
+            # Skip if empty or invalid
+            if not api_attr or re.search(r'[^a-zA-Z0-9_.]', api_attr):
                 continue
             
-            # Determine the parent object if it's a nested path
+            # Generate sample value based on attribute name
+            value = self.generate_sample_value(api_attr, view_attr)
+            
+            # Handle nested attributes (with dots)
             if "." in api_attr:
                 parts = api_attr.split(".")
-                parent = parts[0]
-                child = ".".join(parts[1:])
-                
-                if parent not in attribute_groups:
-                    attribute_groups[parent] = []
-                
-                attribute_groups[parent].append({
-                    "child_attr": child,
-                    "mapping": mapping
-                })
+                current = body
+                for i, part in enumerate(parts):
+                    if i == len(parts) - 1:
+                        current[part] = value
+                    else:
+                        if part not in current:
+                            current[part] = {}
+                        current = current[part]
             else:
-                if "root" not in attribute_groups:
-                    attribute_groups["root"] = []
-                
-                attribute_groups["root"].append({
-                    "child_attr": api_attr,
-                    "mapping": mapping
-                })
-        
-        # Process root attributes
-        if "root" in attribute_groups:
-            for item in attribute_groups["root"]:
-                api_attr = item["child_attr"]
-                mapping = item["mapping"]
-                view_attr = mapping.get("view_attribute", "")
-                
-                # Generate appropriate sample value
-                value = self.generate_sample_value(api_attr, view_attr, parsed_view)
                 body[api_attr] = value
-        
-        # Process nested objects
-        for parent, items in attribute_groups.items():
-            if parent == "root":
-                continue
-                
-            if parent not in body:
-                body[parent] = {}
-                
-            for item in items:
-                child_attr = item["child_attr"]
-                mapping = item["mapping"]
-                view_attr = mapping.get("view_attribute", "")
-                
-                # For multi-level nesting
-                if "." in child_attr:
-                    parts = child_attr.split(".")
-                    current = body[parent]
-                    for i, part in enumerate(parts):
-                        if i == len(parts) - 1:
-                            current[part] = self.generate_sample_value(part, view_attr, parsed_view)
-                        else:
-                            if part not in current:
-                                current[part] = {}
-                            current = current[part]
-                else:
-                    body[parent][child_attr] = self.generate_sample_value(child_attr, view_attr, parsed_view)
         
         return body
     
-    def generate_response_body(self, attribute_mappings, parsed_view=None):
-        """Generate a sample response body based on attribute mappings."""
-        # Response body is similar to request body but may include additional fields
-        # like IDs, timestamps, etc. that are not in the request
+    def generate_response_body(self, attribute_mappings):
+        """Generate a sample response body with additional standard fields."""
+        response = self.generate_request_body(attribute_mappings)
         
-        response = self.generate_request_body(attribute_mappings, parsed_view)
-        
-        # Add standard API response fields
+        # Add standard API response fields if not already present
         if isinstance(response, dict):
             if not any(k in ["id", "guid"] for k in response.keys()):
                 response["id"] = "12345"
             
-            if not any(k in ["createdAt", "createdDate", "created"] for k in response.keys()):
+            if not any(k in ["createdAt", "createdDate"] for k in response.keys()):
                 response["createdAt"] = "2024-04-04T12:00:00Z"
                 
-            if not any(k in ["updatedAt", "updatedDate", "lastUpdated"] for k in response.keys()):
+            if not any(k in ["updatedAt", "lastUpdated"] for k in response.keys()):
                 response["updatedAt"] = "2024-04-04T12:30:00Z"
         
         return response
     
-    def generate_sample_value(self, api_attr, view_attr, parsed_view=None):
+    def generate_sample_value(self, api_attr, view_attr):
         """Generate appropriate sample value based on attribute name."""
         attr_lower = api_attr.lower()
         
-        # Look for categorized columns if parsed_view is available
-        if parsed_view:
-            categorized = SQLParser.categorize_columns(parsed_view)
-            for cat_col in categorized:
-                col = cat_col["column"]
-                name = col.get("name", "").lower()
-                alias = col.get("alias", "").lower() if col.get("alias") else ""
-                display_name = alias or name
-                
-                if display_name == view_attr.lower():
-                    category = cat_col["category"]
-                    data_type = cat_col.get("data_type", "string")
-                    
-                    if category == "identifier":
-                        return "12345"
-                    elif category == "datetime":
-                        return "2024-04-04T12:00:00Z"
-                    elif category == "numeric":
-                        return 100.00
-                    elif category == "code":
-                        return "ACTIVE"
-                    elif category == "currency":
-                        return "USD"
-        
-        # If no match in categorized columns, use naming patterns
+        # Use naming patterns to determine appropriate sample values
         if re.search(r'id$|guid$', attr_lower):
             return "12345"
         elif re.search(r'date$|time$|timestamp$', attr_lower):
@@ -2212,7 +1817,7 @@ class MappingGenerator:
         elif re.search(r'exchange$', attr_lower):
             return "CME"
         else:
-            return "value"
+            return "sample_value"
 
 class CopperAssistant:
     """Main class for the COPPER View to API Mapper."""
@@ -2249,7 +1854,7 @@ class CopperAssistant:
                 self.model
             )
             
-            # Conversation memory
+            # Conversation memory for context
             self.memory = []
             
             # Response cache
@@ -2262,54 +1867,61 @@ class CopperAssistant:
             logger.error(f"Error initializing COPPER Assistant: {str(e)}")
             print(f"Initialization error: {str(e)}")
     
-    def is_initialized(self):
-        """Check if the assistant is properly initialized."""
-        return self.initialized
-    
     def preload_data(self):
-        """Preload critical data."""
+        """Preload critical data for faster responses."""
         try:
             logger.info("Preloading critical data...")
             
             # Load important Confluence pages
             pages_loaded = self.confluence.load_critical_pages()
+            logger.info(f"Loaded {pages_loaded} critical Confluence pages")
             
-            # Test connections and preload critical data
+            # Start loading all spaces in background
+            threading.Thread(target=self.confluence.load_all_spaces, daemon=True).start()
+            
+            # Test Stash connection and preload file list
             stash_connected = self.stash.test_connection()
+            logger.info(f"Stash connection status: {stash_connected}")
             
-            # Preload some view list
+            # Preload view list
             files = self.stash.list_files()
+            logger.info(f"Preloaded {len(files)} SQL files from repository")
             
-            logger.info(f"Preloaded {pages_loaded} critical pages, Stash connected: {stash_connected}, Files listed: {len(files)}")
             return True
             
         except Exception as e:
             logger.error(f"Error preloading data: {str(e)}")
-            print(f"Preloading error: {str(e)}")
             return False
     
-    def answer_question(self, query):
-        """Answer a user question about COPPER views and APIs."""
+    def answer_question(self, question):
+        """
+        Answer a user question about COPPER views and APIs.
+        
+        Args:
+            question: The user's question
+            
+        Returns:
+            The answer
+        """
         if not self.initialized:
             return "Sorry, I'm not properly initialized. Please check the logs for errors."
         
         try:
-            logger.info(f"Processing query: {query}")
+            logger.info(f"Processing question: {question}")
             
-            # Check cache
-            cache_key = hashlib.md5(query.encode()).hexdigest()
+            # Create a cache key for this question
+            cache_key = hashlib.md5(question.encode('utf-8')).hexdigest()
             if cache_key in self.response_cache:
                 logger.info("Returning cached response")
                 return self.response_cache[cache_key]
             
-            # Detect intent
-            intent = self.detect_intent(query)
+            # Detect intent to determine how to process
+            intent = self.detect_intent(question)
             logger.info(f"Detected intent: {intent}")
             
-            # Process based on intent
             if intent == "view_mapping":
                 # Extract view name
-                view_name = self.extract_view_name(query)
+                view_name = self.extract_view_name(question)
                 if view_name:
                     logger.info(f"Generating mapping for view: {view_name}")
                     response = self.generate_view_mapping_response(view_name)
@@ -2318,7 +1930,7 @@ class CopperAssistant:
             
             elif intent == "sql_mapping":
                 # Extract SQL query
-                sql = self.extract_sql(query)
+                sql = self.extract_sql(question)
                 if sql:
                     logger.info("Generating mapping from SQL")
                     response = self.generate_sql_mapping_response(sql)
@@ -2327,26 +1939,18 @@ class CopperAssistant:
             
             elif intent == "api_usage":
                 logger.info("Generating API usage information")
-                response = self.generate_api_usage_response(query)
+                response = self.generate_api_usage_response(question)
             
             else:
                 # General question
                 logger.info("Generating general response")
-                response = self.generate_general_response(query)
+                response = self.generate_general_response(question)
             
             # Cache the response
             self.response_cache[cache_key] = response
             
             # Update conversation memory
-            self.memory.append({
-                "query": query,
-                "response": response[:200] + "..." if len(response) > 200 else response,  # Store truncated version in memory
-                "timestamp": time.time()
-            })
-            
-            # Keep only last 5 exchanges
-            if len(self.memory) > 5:
-                self.memory.pop(0)
+            self.update_memory(question, response)
             
             return response
             
@@ -2354,21 +1958,20 @@ class CopperAssistant:
             logger.error(f"Error answering question: {str(e)}")
             return f"I encountered an error while processing your question: {str(e)}"
     
-    def detect_intent(self, query):
-        """Detect the intent of the user's query."""
-        query_lower = query.lower()
+    def detect_intent(self, question):
+        """Detect the intent of the user's question."""
+        question_lower = question.lower()
         
         # Check for view mapping intent
         view_patterns = [
-            r"what\s+(?:is|are)\s+(?:the\s+)?mapping\s+for",
             r"mapping\s+for\s+(?:view|table)?",
             r"map\s+(?:view|table)",
             r"view\s+to\s+api",
             r"which\s+api\s+(?:for|to\s+use\s+with)\s+(?:view|table)",
-            r"W_[A-Za-z0-9_]+"
+            r"what\s+is\s+the\s+mapping\s+for"
         ]
         for pattern in view_patterns:
-            if re.search(pattern, query_lower):
+            if re.search(pattern, question_lower):
                 return "view_mapping"
         
         # Check for SQL mapping intent
@@ -2376,12 +1979,10 @@ class CopperAssistant:
             r"create\s+(?:or\s+replace\s+)?view",
             r"select\s+.*?\s+from",
             r"map\s+this\s+sql",
-            r"generate\s+mapping\s+for\s+sql",
-            r"provide\s+mapping\s+for\s+sql",
-            r"sql\s+query\s+to\s+api"
+            r"generate\s+mapping\s+for\s+sql"
         ]
         for pattern in sql_patterns:
-            if re.search(pattern, query_lower):
+            if re.search(pattern, question_lower):
                 return "sql_mapping"
         
         # Check for API usage intent
@@ -2391,42 +1992,40 @@ class CopperAssistant:
             r"what\s+is\s+the\s+endpoint",
             r"how\s+to\s+call",
             r"api\s+for\s+(?!view)",
-            r"supported\s+operators",
-            r"find\s+(?:all|the)\s+\w+\s+for"
+            r"supported\s+operators"
         ]
         for pattern in api_patterns:
-            if re.search(pattern, query_lower):
+            if re.search(pattern, question_lower):
                 return "api_usage"
         
         # Default to general question
         return "general"
     
-    def extract_view_name(self, query):
-        """Extract view name from query."""
+    def extract_view_name(self, question):
+        """Extract view name from question."""
         # Try common patterns
         patterns = [
             r"(?:view|table)\s+(?:named|called)\s+([A-Za-z0-9_]+)",
             r"(?:for|of|to)\s+(?:view|table)?\s+([A-Za-z0-9_]+)",
             r"mapping\s+(?:for|of)\s+([A-Za-z0-9_]+)",
             r"([A-Za-z0-9_]+)\s+view\s+to\s+api",
-            r"(W_[A-Za-z0-9_]+)",
-            r"(STATIC_VW_[A-Za-z0-9_]+)"
+            r"W_[A-Za-z0-9_]+"
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
+            match = re.search(pattern, question, re.IGNORECASE)
             if match:
                 return match.group(1)
         
         # Look for words that match common view name patterns
-        words = re.findall(r'\b[A-Za-z0-9_]+\b', query)
+        words = re.findall(r'\b[A-Za-z0-9_]+\b', question)
         for word in words:
-            if word.startswith('W_') or word.startswith('STATIC_VW_') or word.upper() == word:
+            if word.startswith('W_') or word.upper() == word:
                 return word
         
         return None
     
-    def extract_sql(self, query):
+    def extract_sql(self, question):
         """Extract SQL query from user input."""
         # Look for code blocks
         code_block_patterns = [
@@ -2436,7 +2035,7 @@ class CopperAssistant:
         ]
         
         for pattern in code_block_patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
+            match = re.search(pattern, question, re.IGNORECASE)
             if match:
                 return match.group(1).strip()
         
@@ -2447,7 +2046,7 @@ class CopperAssistant:
         ]
         
         for pattern in sql_patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
+            match = re.search(pattern, question, re.IGNORECASE)
             if match:
                 return match.group(1).strip()
         
@@ -2507,7 +2106,7 @@ class CopperAssistant:
         if source == "documentation":
             response += "*This mapping was found in the COPPER documentation.*\n"
         elif source == "pattern_matching":
-            response += "*This mapping was generated based on naming patterns and schema analysis. Please verify before use.*\n"
+            response += "*This mapping was generated based on naming patterns. Please verify before use.*\n"
         elif source == "ai_generated":
             response += "*This mapping was generated using AI based on the view definition and API documentation. Please verify before use.*\n"
         
@@ -2571,42 +2170,48 @@ class CopperAssistant:
         if source == "documentation":
             response += "*This mapping was found in the COPPER documentation.*\n"
         elif source == "pattern_matching":
-            response += "*This mapping was generated based on naming patterns and schema analysis. Please verify before use.*\n"
+            response += "*This mapping was generated based on naming patterns. Please verify before use.*\n"
         elif source == "ai_generated":
             response += "*This mapping was generated using AI based on the SQL definition and API documentation. Please verify before use.*\n"
         
         return response
     
-    def generate_api_usage_response(self, query):
+    def generate_api_usage_response(self, question):
         """Generate response about API usage."""
-        # Identify specific API topics
-        topics = self.extract_api_topics(query)
-        
         # Get relevant API documentation
-        context = self.get_api_documentation(topics)
-        context_memory = self.get_conversation_context()
+        search_results = self.confluence.search_content(question, max_results=5)
         
-        # Generate response with AI using enhanced prompting
+        context = []
+        for page, content, score, space in search_results:
+            context.append(content["formatted"])
+        
+        # Additional context from specific pages
+        api_topics = ["endpoint", "api", "operator"]
+        for topic in api_topics:
+            if topic in question.lower():
+                for key, page_info in IMPORTANT_PAGES.items():
+                    if topic in key.lower():
+                        page_content = self.confluence.get_page_content(page_info["id"])
+                        if page_content:
+                            context.append(page_content["formatted"])
+        
+        # Add conversation context
+        conversation_context = self.get_conversation_context()
+        
+        # Generate response with AI
         prompt = f"""
-        You are a COPPER API expert at CME Group. You're chatting with a colleague who's asking about the COPPER API. 
+        You are a COPPER API expert working at CME. A colleague has asked you this question:
         
-        COLLEAGUE'S QUESTION: {query}
+        {question}
         
-        RELEVANT COPPER API DOCUMENTATION:
-        {context}
+        Here is relevant information from the COPPER API documentation:
         
-        PREVIOUS CONVERSATION:
-        {context_memory}
+        {' '.join(context[:3])}
         
-        As their teammate, provide a helpful, detailed response that directly answers their question. Include:
-        - Specific API endpoints, parameters, and usage examples when applicable
-        - Clear explanations in a conversational but professional tone
-        - Code samples or JSON examples where helpful
-        - Friendly advice on best practices
+        Previous conversation:
+        {conversation_context}
         
-        Your colleague appreciates thorough answers that go beyond the basic documentation, with real-world usage insights that will help them implement solutions effectively.
-        
-        Remember to format your response with proper Markdown for readability, and use a warm, collaborative tone as you would when helping a valued coworker.
+        Give a clear, helpful response in a professional but conversational tone. Include specific API endpoints, parameters, and examples where relevant. Format your response using Markdown. Be concise but thorough, and focus directly on answering the question.
         """
         
         try:
@@ -2614,166 +2219,96 @@ class CopperAssistant:
                 prompt,
                 generation_config=GenerationConfig(
                     temperature=0.3,
-                    max_output_tokens=8000
-                )
-            )
-            
-            if response.candidates and response.candidates[0].text:
-                result = response.candidates[0].text.strip()
-                return result
-            else:
-                return "I couldn't find specific information about that in the COPPER API documentation. Could you try rephrasing your question or provide more details about what you're trying to do?"
-                
-        except Exception as e:
-            logger.error(f"Error generating API usage response: {str(e)}")
-            return f"I encountered an error while generating the response: {str(e)}"
-    
-    def extract_api_topics(self, query):
-        """Extract API-related topics from query."""
-        topics = []
-        
-        # Check for common API-related terms
-        api_topics = {
-            "product": ["product", "products"],
-            "instrument": ["instrument", "instruments"],
-            "trade": ["trade", "trades", "trading"],
-            "session": ["session", "sessions"],
-            "firm": ["firm", "firms"],
-            "user": ["user", "users"],
-            "timestamp": ["timestamp", "time", "date"],
-            "operator": ["operator", "operators", "operations"],
-            "endpoint": ["endpoint", "endpoints", "api", "rest"],
-            "orchestrator": ["orchestrator", "orchestration"],
-            "repo": ["repo", "repository", "repos"],
-            "permission": ["permission", "permissions", "access"]
-        }
-        
-        query_lower = query.lower()
-        for topic, terms in api_topics.items():
-            if any(term in query_lower for term in terms):
-                topics.append(topic)
-        
-        return topics
-    
-    def get_api_documentation(self, topics=None):
-        """Get relevant API documentation based on topics."""
-        all_results = []
-        
-        # First search in all confluence spaces for specific query terms
-        for topic in topics or ["api"]:
-            results = self.confluence.search_content(topic, max_results=5)
-            all_results.extend(results)
-        
-        # Deduplicate results
-        seen_ids = set()
-        unique_results = []
-        for result in all_results:
-            page_id = result[0].get("id")
-            if page_id not in seen_ids:
-                seen_ids.add(page_id)
-                unique_results.append(result)
-        
-        # Format context from search results
-        context = []
-        for page, content, score, space_key in unique_results[:10]:  # Use top 10 unique results
-            context.append(f"### {page['title']} (relevance: {score:.2f})")
-            context.append(content["formatted"])
-        
-        # Add specific important pages for relevant topics
-        if topics:
-            if "operator" in topics:
-                page_info = IMPORTANT_PAGES.get("supported_operators")
-                if page_info and page_info["id"] not in seen_ids:
-                    page_content = self.confluence.get_page_content(page_info["id"])
-                    if page_content:
-                        context.append(f"### {page_info['title']} (important reference)")
-                        context.append(page_content["formatted"])
-                        seen_ids.add(page_info["id"])
-            
-            if "endpoint" in topics or "api" in topics:
-                page_info = IMPORTANT_PAGES.get("api_endpoints")
-                if page_info and page_info["id"] not in seen_ids:
-                    page_content = self.confluence.get_page_content(page_info["id"])
-                    if page_content:
-                        context.append(f"### {page_info['title']} (important reference)")
-                        context.append(page_content["formatted"])
-                        seen_ids.add(page_info["id"])
-        
-        # Always include FAQ as a fallback
-        page_info = IMPORTANT_PAGES.get("api_faq")
-        if page_info and page_info["id"] not in seen_ids:
-            page_content = self.confluence.get_page_content(page_info["id"])
-            if page_content:
-                context.append(f"### {page_info['title']} (common questions)")
-                context.append(page_content["formatted"])
-        
-        return "\n\n".join(context)
-    
-    def generate_general_response(self, query):
-        """Generate response for general questions."""
-        # Get relevant documentation
-        search_results = self.confluence.search_content(query, max_results=10)
-        
-        context = []
-        for page, content, score, space_key in search_results[:5]:  # Use top 5 results
-            context.append(f"### {page['title']} (relevance: {score:.2f})")
-            context.append(content["formatted"])
-        
-        # Include conversation history for context
-        conversation_context = self.get_conversation_context()
-        
-        # Generate response with AI using conversational prompting
-        prompt = f"""
-        You are a helpful COPPER API expert at CME Group having a conversation with a colleague. You're known for your deep knowledge and friendly, helpful approach.
-        
-        COLLEAGUE'S QUESTION: {query}
-        
-        RELEVANT COPPER DOCUMENTATION:
-        {' '.join(context)}
-        
-        PREVIOUS CONVERSATION:
-        {conversation_context}
-        
-        As a fellow teammate, respond in a conversational, helpful tone. Be thorough but natural in your response, as if you were chatting with a work friend.
-        
-        If the documentation doesn't have the specific answer, acknowledge that and provide your best suggestion based on your understanding of COPPER and APIs in general.
-        
-        Format your response using Markdown for readability, and feel free to use analogies or examples to clarify complex concepts - just like you would in a real conversation.
-        """
-        
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config=GenerationConfig(
-                    temperature=0.4,
-                    max_output_tokens=8000
+                    max_output_tokens=4000
                 )
             )
             
             if response.candidates and response.candidates[0].text:
                 return response.candidates[0].text.strip()
             else:
-                return "I couldn't find specific information about that in the COPPER documentation. Could you tell me more about what you're trying to achieve?"
+                return "I couldn't find specific information about that in the COPPER API documentation. Could you try rephrasing your question or providing more details?"
+                
+        except Exception as e:
+            logger.error(f"Error generating API usage response: {str(e)}")
+            return f"I encountered an error while generating the response: {str(e)}"
+    
+    def generate_general_response(self, question):
+        """Generate response for general questions."""
+        # Get relevant documentation
+        search_results = self.confluence.search_content(question, max_results=8)
+        
+        context = []
+        for page, content, score, space in search_results[:5]:  # Use top 5 results
+            context.append(f"## {page['title']}\n{content['formatted'][:2000]}")
+        
+        # Add conversation context
+        conversation_context = self.get_conversation_context()
+        
+        # Generate response with AI
+        prompt = f"""
+        You are a COPPER expert working at CME. A colleague has asked you this question:
+        
+        {question}
+        
+        Here is relevant information from the COPPER documentation:
+        
+        {' '.join(context)}
+        
+        Previous conversation:
+        {conversation_context}
+        
+        Give a clear, helpful response in a professional but conversational tone. Format your response using Markdown. Be concise but thorough, and focus directly on answering the question.
+        """
+        
+        try:
+            response = self.model.generate_content(
+                prompt,
+                generation_config=GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=4000
+                )
+            )
+            
+            if response.candidates and response.candidates[0].text:
+                return response.candidates[0].text.strip()
+            else:
+                return "I couldn't find specific information about that in the COPPER documentation. Could you try rephrasing your question or providing more details?"
                 
         except Exception as e:
             logger.error(f"Error generating general response: {str(e)}")
             return f"I encountered an error while generating the response: {str(e)}"
     
+    def update_memory(self, question, response):
+        """Update conversation memory with latest exchange."""
+        self.memory.append({
+            "question": question,
+            "response": response,
+            "timestamp": time.time()
+        })
+        
+        # Keep only last 5 exchanges
+        if len(self.memory) > 5:
+            self.memory.pop(0)
+    
     def get_conversation_context(self):
         """Get formatted conversation history for context."""
         if not self.memory:
-            return "This is our first exchange about this topic."
+            return "No previous conversation."
         
         context = []
         for i, exchange in enumerate(self.memory[-3:]):  # Last 3 exchanges
-            context.append(f"You asked: {exchange['query']}")
-            context.append(f"I responded: {exchange['response']}")
+            context.append(f"Question {i+1}: {exchange['question']}")
+            # Limit response length
+            response = exchange['response']
+            if len(response) > 200:
+                response = response[:200] + "..."
+            context.append(f"Answer {i+1}: {response}")
         
         return "\n\n".join(context)
 
 def main():
     """Main function to run the COPPER View to API Mapper."""
-    print("\n=== COPPER View to API Mapper - CME BLR Hackathon 2025 ===\n")
+    print("\n=== COPPER View to API Mapper ===\n")
     print("Initializing...")
     
     # Initialize the assistant
@@ -2783,19 +2318,18 @@ def main():
         print("Error: Failed to initialize. Please check the logs for details.")
         return
     
-    # Preload data
-    print("Loading documentation and API resources...")
+    # Preload critical data
+    print("Loading documentation and SQL views...")
     assistant.preload_data()
     
     print("\n=== COPPER View to API Mapper ===")
-    print("Ready to help you map COPPER database views to REST APIs!")
-    print("\nWhat you can ask:")
-    print("  • \"What is the mapping for view W_CORE_TCC_SPAN_MAPPING?\"")
-    print("  • \"Which API can I use to get product data?\"")
-    print("  • \"How do I find all instruments for an exchange?\"")
-    print("  • \"What operators are supported for timestamps?\"")
-    print("  • \"Provide mapping for SQL: CREATE VIEW my_view AS SELECT...\"")
-    print("  • \"Why and how is Orchestrator used?\"")
+    print("I can help you map COPPER database views to REST APIs.")
+    print("\nExamples of what you can ask:")
+    print("  - What is the mapping for view W_CORE_TCC_SPAN_MAPPING?")
+    print("  - Which API can I use to get product data?")
+    print("  - How do I find all instruments for an exchange?")
+    print("  - What operators are supported for timestamps?")
+    print("  - Map this SQL: CREATE VIEW my_view AS SELECT...")
     print("\nType 'exit' to quit.")
     
     while True:
@@ -2809,7 +2343,7 @@ def main():
             if not query:
                 continue
                 
-            print("\nAnalyzing your question...")
+            print("\nWorking on your request...")
             start_time = time.time()
             
             response = assistant.answer_question(query)
