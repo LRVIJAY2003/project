@@ -559,3 +559,237 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+#########################################################
+# BMC Helix + Gemini AI Incident Analysis Chatbot
+# Features:
+# - Integrated with BMC Helix REST API
+# - Gemini AI for natural language processing
+# - Automatic date range detection
+# - Smart data categorization
+# - Professional chat interface
+# - Built-in error handling
+#########################################################
+
+import os
+import json
+import requests
+import vertexai
+from datetime import datetime, timedelta
+from dateutil import parser
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+import logging
+import urllib3
+import getpass
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Configuration - Hardcoded for testing (Update these values)
+CONFIG = {
+    "BMC": {
+        "server": "cmegroup-restapi.onbmc.com",
+        "username": "YOUR_SERVICE_ACCOUNT",
+        "password": "YOUR_PASSWORD",
+        "incident_form": "HPD:IncidentInterface"
+    },
+    "GEMINI": {
+        "project_id": "pri-dv-cws-4363",
+        "location": "us-central1",
+        "model_name": "gemini-2.0-flash-001"
+    },
+    "DATE_FORMAT": "%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("helix_chatbot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("HelixChatbot")
+
+class HelixConnector:
+    def __init__(self):
+        self.token = None
+        self.session = requests.Session()
+        self.session.verify = False
+        
+    def login(self):
+        """Authenticate with BMC Helix"""
+        url = f"https://{CONFIG['BMC']['server']}/api/jwt/login"
+        try:
+            response = self.session.post(
+                url,
+                data={'username': CONFIG['BMC']['username'], 
+                      'password': CONFIG['BMC']['password']},
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            )
+            if response.status_code == 200:
+                self.token = response.text
+                logger.info("BMC Helix login successful")
+                return True
+            logger.error(f"Login failed: {response.status_code}")
+            return False
+        except Exception as e:
+            logger.error(f"Login exception: {str(e)}")
+            return False
+
+    def get_incidents(self, days_back=7):
+        """Retrieve incidents from BMC Helix"""
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days_back)
+        
+        query = (
+            f"'Submit Date' >= \"{start_date.strftime(CONFIG['DATE_FORMAT'])}\""
+            f" AND 'Submit Date' <= \"{end_date.strftime(CONFIG['DATE_FORMAT'])}\""
+        )
+        
+        url = (
+            f"https://{CONFIG['BMC']['server']}/api/arsys/v1/entry/{CONFIG['BMC']['incident_form']}"
+            f"?q={query}"
+            "&fields=Incident Number,Status,Priority,Submit Date,Assigned Group,Description,Category"
+        )
+        
+        try:
+            response = self.session.get(
+                url,
+                headers={'Authorization': f'AR-JWT {self.token}'}
+            )
+            if response.status_code == 200:
+                return response.json().get('entries', [])
+            logger.error(f"Incident fetch failed: {response.status_code}")
+            return None
+        except Exception as e:
+            logger.error(f"Incident fetch exception: {str(e)}")
+            return None
+
+class GeminiAnalyzer:
+    def __init__(self):
+        vertexai.init(
+            project=CONFIG['GEMINI']['project_id'],
+            location=CONFIG['GEMINI']['location']
+        )
+        self.model = GenerativeModel(CONFIG['GEMINI']['model_name'])
+        self.config = GenerationConfig(
+            temperature=0.3,
+            top_p=0.9,
+            max_output_tokens=8192
+        )
+
+    def analyze_incidents(self, incidents, query):
+        """Analyze incidents using Gemini AI"""
+        prompt = f"""
+        You are a professional IT support analyst. Analyze these {len(incidents)} incidents 
+        based on the user query: "{query}". 
+
+        Instructions:
+        1. Understand the user's intent and required analysis type
+        2. Categorize incidents appropriately
+        3. Create a professional summary
+        4. Generate a markdown table with key details
+        5. Highlight critical issues if any
+
+        Incident Data:
+        {json.dumps(incidents, indent=2)}
+
+        Respond in this format:
+        **Summary**: [concise analysis]
+        
+        **Recommendations**: [bullet points]
+        
+        **Incident Details**:
+        | Column1 | Column2 | ... |
+        |---------|---------|-----|
+        | ...     | ...     | ... |
+        """
+
+        try:
+            response = self.model.generate_content(
+                prompt,
+                generation_config=self.config
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini analysis failed: {str(e)}")
+            return "Sorry, I encountered an error processing your request."
+
+class ChatbotEngine:
+    def __init__(self):
+        self.helix = HelixConnector()
+        self.gemini = GeminiAnalyzer()
+        
+    def process_query(self, query):
+        """Main processing pipeline"""
+        # Detect date range in query
+        days_back = self._detect_date_range(query)
+        
+        # Fetch incidents
+        if not self.helix.login():
+            return "Error: Failed to connect to BMC Helix"
+            
+        incidents = self.helix.get_incidents(days_back)
+        if not incidents:
+            return "No incidents found for the specified period."
+            
+        # Process with Gemini
+        raw_incidents = [entry['values'] for entry in incidents]
+        return self.gemini.analyze_incidents(raw_incidents, query)
+
+    def _detect_date_range(self, text):
+        """Auto-detect date range from natural language"""
+        text = text.lower()
+        if "yesterday" in text:
+            return 1
+        if "week" in text:
+            return 7
+        if "month" in text:
+            return 30
+        return 7  # Default to 1 week
+
+def main():
+    print("\n=== BMC Helix AI Assistant ===")
+    print("Type 'exit' to quit\n")
+    
+    chatbot = ChatbotEngine()
+    
+    while True:
+        try:
+            query = input("\nHow can I assist you today?\n> ").strip()
+            if not query:
+                continue
+            if query.lower() in ['exit', 'quit']:
+                break
+                
+            print("\nAnalyzing your request...\n")
+            result = chatbot.process_query(query)
+            print("\n" + "-"*50)
+            print(result)
+            print("-"*50 + "\n")
+            
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
+            break
+        except Exception as e:
+            print(f"\nError: {str(e)}")
+            logger.error(f"Main loop error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
