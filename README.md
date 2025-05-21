@@ -70,12 +70,11 @@ services:
     - krmName: sphere-traffic-surge-usc1
       displayName: "Traffic Surge Alert: 2x baseline in 5min"
       mode: STATS
-      # No goal needed for surge alert as it's threshold-based
+      goal: 0.95  # Required for schema validation
       serviceLevelIndicator:
-        windowsBased:
-          metricMeanInRange:
-            timeSeries: "metric.type=\"workload.googleapis.com/http.server.request.count\" resource.type=\"k8s_container\" metric.labels.app_id=\"2852\" metric.labels.component_id=\"coml-5913\" metric.labels.namespace=\"app-2852-default\" metric.labels.http_route=monitoring.regex.full_match(\"/rest/.*\") resource.labels.location=\"us-central1\""
-            rangeMin: 0
+        basicSli:
+          availability:
+            enabled: true
       # Custom alert policy for surge detection
       alertPolicy:
         displayName: "Sphere Traffic Surge Alert"
@@ -87,6 +86,8 @@ services:
                 - alignmentPeriod: "60s"
                   perSeriesAligner: "ALIGN_RATE"
                   crossSeriesReducer: "REDUCE_SUM"
+                  groupByFields:
+                    - "resource.labels.pod_name"
               comparison: "COMPARISON_GT"
               thresholdValue: 2.0  # 2x normal traffic
               duration: "300s"  # Sustained for 5 minutes
