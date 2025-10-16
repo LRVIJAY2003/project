@@ -1,1429 +1,971 @@
-You're absolutely right! Let me carefully review the logic and fix all the issues. The problem is in the field mappings - I need to ensure consistency and accuracy.
-Updated index.html (Complete Replacement - VERIFIED)
-Let me trace through the logic:
-EDB Table should show:
-OSCAR: guid, gfid, gus_id, namespace, status
-CoPPER: guid, gfid, gus_id, eff_to, status
-EDB: guid, gfid, gus_id, eff_to, status
-STAR Table should show:
-OSCAR: guid, gfid, gus_id, namespace, status
-CoPPER: guid, gfid, gus_id, eff_to, exch_id, status (CoPPER has GUID here!)
-STAR: gfid, gfid_description, exchange_id (STAR does NOT have GUID)
-Here's the corrected version:
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OSCAR Reconciliation Tool</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+You're right! Let's debug the backend. The issue is likely in how we're extracting data from the XML in the PostgreSQL query or how we're processing the results. Let me provide a comprehensive fix for `app.py`.
 
-        :root {
-            --primary-color: #1a365d;
-            --primary-light: #2c5aa0;
-            --primary-dark: #0f2537;
-            --secondary-color: #e53e3e;
-            --accent-color: #00b4d8;
-            --accent-light: #48cae4;
-            --success-color: #38a169;
-            --success-light: #48bb78;
-            --warning-color: #ed8936;
-            --warning-light: #f6ad55;
-            --error-color: #e53e3e;
-            --error-light: #fc8181;
+## Updated app.py (Backend Fix - Complete Replacement)
+
+```python
+from flask import Flask, render_template, request, jsonify
+from google.cloud.sql.connector import Connector
+import google.auth
+from sqlalchemy import create_engine, text
+import oracledb
+import sqlalchemy
+import re
+import os
+from ldap3 import Server, Connection, ALL
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+import traceback
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Flask app
+app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False
+
+# Database configurations
+CA_CERT_PATH = "./new.pem"  # Update this path for your environment
+
+DB_INSTANCES = {
+    'oscar': {
+        'project': 'pri-dv-oscar-0302',
+        'region': 'us-central1',
+        'instance': 'csal-dv-usc1-1316-oscar-0004-m',
+        'database': 'padk',
+        'user': 'lakshya.vijay@cmegroup.com',
+        'schema': 'dv01cosrs',
+        'description': 'OSCAR Database Instance'
+    }
+}
+
+ORACLE_INSTANCES = {
+    'copper': {
+        'user': 'QF44CCRDO',
+        'password': 'Felty_22_PAMPA_TRJ_44',
+        'url': 'ldap://ORAQALDAP:3060/DCCRDC,cn=OracleContext,dc=world',
+        'description': 'CoPPER Database'
+    },
+    'edb': {
+        'user': 'DV02CEDBO',
+        'password': 'eh02eedbo',
+        'url': 'ldap://ORAQALDAP:3060/DCEDBA,cn=OracleContext,dc=world',
+        'description': 'EDB Database'
+    },
+    'star': {
+        'user': 'DV99CFASO',
+        'password': 'DV99CFASOJ',
+        'url': 'ldap://ORAQALDAP:3060/DCFASA,cn=OracleContext,dc=world',
+        'description': 'STAR Database'
+    }
+}
+
+
+class DatabaseConnector:
+    """PostgreSQL connector for OSCAR"""
+    
+    def __init__(self, instance_name: str):
+        if instance_name not in DB_INSTANCES:
+            raise ValueError(f"Unknown instance: {instance_name}")
+        
+        self.instance_name = instance_name
+        self.config = DB_INSTANCES[instance_name]
+        self.project = self.config['project']
+        self.region = self.config['region']
+        self.instance = self.config['instance']
+        self.database = self.config['database']
+        self.user = self.config['user']
+        self.schema = self.config['schema']
+        self.instance_connection_name = f"{self.project}:{self.region}:{self.instance}"
+        self.connector = None
+        self.engine = None
+        self._initialize_connection()
+    
+    def _initialize_connection(self):
+        try:
+            logger.info(f"Initializing {self.config['description']} connector")
             
-            --white: #ffffff;
-            --gray-50: #f9fafb;
-            --gray-100: #f3f4f6;
-            --gray-200: #e5e7eb;
-            --gray-300: #d1d5db;
-            --gray-400: #9ca3af;
-            --gray-500: #6b7280;
-            --gray-600: #4b5563;
-            --gray-700: #374151;
-            --gray-800: #1f2937;
-            --gray-900: #111827;
+            # SSL disable hack
+            if os.path.exists(CA_CERT_PATH):
+                os.environ['REQUESTS_CA_BUNDLE'] = CA_CERT_PATH
+                os.environ['GOOGLE_AUTH_DISABLE_TLS_VERIFY'] = 'True'
+                logger.warning(f"SSL verification disabled: {CA_CERT_PATH}")
+            else:
+                logger.error(f"CA file not found at: {CA_CERT_PATH}")
+                raise FileNotFoundError(f"Required CA file not found at {CA_CERT_PATH}")
             
-            --gradient-primary: linear-gradient(135deg, #1a365d 0%, #2c5aa0 100%);
-            --gradient-accent: linear-gradient(135deg, #00b4d8 0%, #48cae4 100%);
-            --gradient-success: linear-gradient(135deg, #38a169 0%, #48bb78 100%);
-            --gradient-warning: linear-gradient(135deg, #ed8936 0%, #f6ad55 100%);
-            --gradient-error: linear-gradient(135deg, #e53e3e 0%, #fc8181 100%);
+            # Test authentication
+            credentials, project = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/sqlservice.admin"]
+            )
+            logger.info("Authentication successful")
             
-            --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            # Initialize connector
+            self.connector = Connector()
             
-            --spacing-xs: 0.25rem;
-            --spacing-sm: 0.5rem;
-            --spacing-md: 1rem;
-            --spacing-lg: 1.5rem;
-            --spacing-xl: 2rem;
-            --spacing-2xl: 3rem;
+            # Create SQLAlchemy engine
+            self.engine = create_engine(
+                "postgresql+pg8000://",
+                creator=lambda: self.connector.connect(
+                    self.instance_connection_name,
+                    "pg8000",
+                    user=self.user,
+                    db=self.database,
+                    enable_iam_auth=True,
+                    ip_type="PRIVATE"
+                ),
+                pool_size=2,
+                max_overflow=2,
+                pool_pre_ping=True,
+                pool_recycle=300
+            )
+            logger.info("Database engine created successfully")
             
-            --radius-sm: 0.375rem;
-            --radius-md: 0.5rem;
-            --radius-lg: 0.75rem;
-            --radius-xl: 1rem;
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            raise
+    
+    def test_connection(self) -> bool:
+        try:
+            if not self.engine:
+                logger.error("Database engine not initialized")
+                return False
             
-            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-            --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-            --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-            
-            --transition-fast: 0.15s ease-in-out;
-            --transition-normal: 0.3s ease-in-out;
-            --transition-slow: 0.5s ease-in-out;
-        }
-
-        body {
-            font-family: var(--font-family);
-            font-size: 1rem;
-            line-height: 1.6;
-            color: var(--gray-800);
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%);
-            min-height: 100vh;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 0 var(--spacing-lg);
-        }
-
-        .header {
-            background: var(--gradient-primary);
-            color: var(--white);
-            padding: var(--spacing-xl) 0;
-            box-shadow: var(--shadow-xl);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            border-bottom: 3px solid var(--accent-color);
-        }
-
-        .header-content {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .logo {
-            display: flex;
-            align-items: center;
-            gap: var(--spacing-md);
-        }
-
-        .logo i {
-            font-size: 2rem;
-            color: var(--accent-color);
-            animation: rotate 3s linear infinite;
-        }
-
-        @keyframes rotate {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .logo h1 {
-            font-size: 1.75rem;
-            font-weight: 700;
-            margin: 0;
-            background: linear-gradient(135deg, var(--white) 0%, var(--accent-light) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-
-        .connection-status {
-            display: flex;
-            align-items: center;
-            gap: var(--spacing-sm);
-            background: rgba(0, 180, 216, 0.2);
-            padding: var(--spacing-sm) var(--spacing-lg);
-            border-radius: var(--radius-xl);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(0, 180, 216, 0.3);
-        }
-
-        .status-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: var(--success-color);
-            box-shadow: 0 0 10px var(--success-color);
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.6; transform: scale(1.1); }
-        }
-
-        .connection-status span {
-            font-weight: 500;
-            font-size: 0.875rem;
-        }
-
-        .main-content {
-            padding: var(--spacing-2xl) 0;
-            min-height: calc(100vh - 200px);
-        }
-
-        .welcome-section {
-            text-align: center;
-            margin-bottom: var(--spacing-2xl);
-        }
-
-        .welcome-content h2 {
-            font-size: 2.25rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--white) 0%, var(--accent-color) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin-bottom: var(--spacing-md);
-            text-shadow: 0 0 30px rgba(0, 180, 216, 0.3);
-        }
-
-        .welcome-content p {
-            font-size: 1.125rem;
-            color: var(--gray-300);
-            max-width: 700px;
-            margin: 0 auto;
-        }
-
-        .search-section {
-            margin-bottom: var(--spacing-2xl);
-        }
-
-        .search-card {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: var(--radius-xl);
-            padding: var(--spacing-2xl);
-            box-shadow: var(--shadow-xl);
-            border: 1px solid rgba(0, 180, 216, 0.2);
-            backdrop-filter: blur(10px);
-        }
-
-        .search-header {
-            text-align: center;
-            margin-bottom: var(--spacing-xl);
-        }
-
-        .search-header h3 {
-            font-size: 1.5rem;
-            font-weight: 600;
-            color: var(--primary-color);
-            margin-bottom: var(--spacing-sm);
-        }
-
-        .search-header h3 i {
-            margin-right: var(--spacing-sm);
-            color: var(--accent-color);
-        }
-
-        .search-header p {
-            color: var(--gray-600);
-            font-size: 0.95rem;
-        }
-
-        .form-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: var(--spacing-lg);
-            margin-bottom: var(--spacing-xl);
-        }
-
-        .form-group {
-            display: flex;
-            flex-direction: column;
-            gap: var(--spacing-sm);
-        }
-
-        .form-group label {
-            font-size: 0.875rem;
-            font-weight: 600;
-            color: var(--gray-700);
-        }
-
-        .form-group label i {
-            color: var(--accent-color);
-            margin-right: var(--spacing-xs);
-        }
-
-        .form-group input {
-            padding: var(--spacing-md);
-            border: 2px solid var(--gray-300);
-            border-radius: var(--radius-lg);
-            font-size: 1rem;
-            transition: var(--transition-normal);
-            background: var(--white);
-            font-weight: 500;
-        }
-
-        .form-group input:disabled {
-            background: var(--gray-100);
-            color: var(--gray-400);
-            cursor: not-allowed;
-            opacity: 0.6;
-        }
-
-        .form-group input:focus:not(:disabled) {
-            outline: none;
-            border-color: var(--accent-color);
-            box-shadow: 0 0 0 4px rgba(0, 180, 216, 0.15);
-            transform: translateY(-2px);
-        }
-
-        .input-info {
-            font-size: 0.75rem;
-            color: var(--gray-500);
-            font-style: italic;
-        }
-
-        .divider {
-            text-align: center;
-            margin: var(--spacing-xl) 0;
-            position: relative;
-        }
-
-        .divider::before {
-            content: '';
-            position: absolute;
-            left: 0;
-            top: 50%;
-            width: 42%;
-            height: 2px;
-            background: linear-gradient(90deg, transparent 0%, var(--accent-color) 100%);
-        }
-
-        .divider::after {
-            content: '';
-            position: absolute;
-            right: 0;
-            top: 50%;
-            width: 42%;
-            height: 2px;
-            background: linear-gradient(90deg, var(--accent-color) 0%, transparent 100%);
-        }
-
-        .divider span {
-            background: var(--white);
-            padding: 0 var(--spacing-lg);
-            color: var(--accent-color);
-            font-weight: 700;
-            font-size: 1.125rem;
-            border: 2px solid var(--accent-color);
-            border-radius: var(--radius-xl);
-            display: inline-block;
-        }
-
-        .btn-primary {
-            background: var(--gradient-accent);
-            color: var(--white);
-            border: none;
-            padding: var(--spacing-lg) var(--spacing-2xl);
-            border-radius: var(--radius-xl);
-            font-size: 1.125rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: var(--transition-normal);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: var(--spacing-md);
-            box-shadow: 0 8px 20px rgba(0, 180, 216, 0.4);
-            border: 2px solid transparent;
-        }
-
-        .btn-primary:hover:not(:disabled) {
-            transform: translateY(-3px);
-            box-shadow: 0 12px 30px rgba(0, 180, 216, 0.6);
-            border-color: var(--accent-light);
-        }
-
-        .btn-primary:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-        }
-
-        .btn-primary i {
-            font-size: 1.25rem;
-        }
-
-        .btn-secondary {
-            background: var(--white);
-            color: var(--primary-color);
-            border: 2px solid var(--primary-color);
-            padding: var(--spacing-sm) var(--spacing-lg);
-            border-radius: var(--radius-lg);
-            font-size: 0.875rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: var(--transition-normal);
-            display: flex;
-            align-items: center;
-            gap: var(--spacing-sm);
-        }
-
-        .btn-secondary:hover {
-            background: var(--primary-color);
-            color: var(--white);
-            transform: translateY(-2px);
-            box-shadow: var(--shadow-lg);
-        }
-
-        .submit-container {
-            text-align: center;
-            margin-top: var(--spacing-xl);
-        }
-
-        .results-section {
-            display: none;
-            animation: fadeInUp 0.6s ease-out;
-        }
-
-        .results-section.show {
-            display: block;
-        }
-
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .results-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: var(--spacing-xl);
-            background: rgba(255, 255, 255, 0.1);
-            padding: var(--spacing-lg);
-            border-radius: var(--radius-xl);
-            backdrop-filter: blur(10px);
-        }
-
-        .results-header h3 {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--white);
-        }
-
-        .results-header h3 i {
-            margin-right: var(--spacing-sm);
-            color: var(--accent-color);
-        }
-
-        .results-actions {
-            display: flex;
-            gap: var(--spacing-md);
-        }
-
-        .scenario-card {
-            background: linear-gradient(135deg, rgba(0, 180, 216, 0.95) 0%, rgba(72, 202, 228, 0.95) 100%);
-            border-radius: var(--radius-xl);
-            padding: var(--spacing-2xl);
-            box-shadow: 0 15px 35px rgba(0, 180, 216, 0.4);
-            margin-bottom: var(--spacing-xl);
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .scenario-card::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            right: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
-            animation: shimmer 3s infinite;
-        }
-
-        @keyframes shimmer {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .scenario-card h4 {
-            font-size: 1.25rem;
-            font-weight: 700;
-            color: var(--white);
-            margin-bottom: var(--spacing-md);
-            display: flex;
-            align-items: center;
-            gap: var(--spacing-sm);
-            position: relative;
-            z-index: 1;
-        }
-
-        .scenario-card h4 i {
-            font-size: 1.5rem;
-        }
-
-        .scenario-content {
-            position: relative;
-            z-index: 1;
-        }
-
-        .scenario-text {
-            color: var(--white);
-            font-size: 1.125rem;
-            font-weight: 600;
-            margin-bottom: var(--spacing-md);
-            padding: var(--spacing-md);
-            background: rgba(255, 255, 255, 0.15);
-            border-radius: var(--radius-lg);
-            border-left: 4px solid var(--white);
-        }
-
-        .action-text {
-            color: var(--white);
-            font-size: 1rem;
-            line-height: 1.8;
-            padding: var(--spacing-lg);
-            background: rgba(26, 54, 93, 0.5);
-            border-radius: var(--radius-lg);
-            border: 2px dashed rgba(255, 255, 255, 0.5);
-        }
-
-        .action-text strong {
-            font-weight: 700;
-            text-decoration: underline;
-        }
-
-        .comparison-tables {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: var(--spacing-2xl);
-            margin-bottom: var(--spacing-xl);
-        }
-
-        .table-section {
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: var(--radius-xl);
-            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
-            overflow: hidden;
-            border: 2px solid var(--accent-color);
-        }
-
-        .table-header {
-            background: var(--gradient-primary);
-            color: var(--white);
-            padding: var(--spacing-xl);
-            text-align: center;
-            position: relative;
-        }
-
-        .table-header::after {
-            content: '';
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-            background: var(--gradient-accent);
-        }
-
-        .table-header h4 {
-            font-size: 1.25rem;
-            font-weight: 700;
-            margin: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: var(--spacing-md);
-        }
-
-        .table-header h4 i {
-            color: var(--accent-color);
-            font-size: 1.5rem;
-        }
-
-        .table-container {
-            overflow-x: auto;
-            max-height: 600px;
-            overflow-y: auto;
-        }
-
-        .comparison-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .comparison-table th {
-            background: linear-gradient(135deg, var(--gray-800) 0%, var(--gray-700) 100%);
-            color: var(--white);
-            padding: var(--spacing-lg);
-            text-align: left;
-            font-weight: 700;
-            font-size: 0.875rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            border-bottom: 3px solid var(--accent-color);
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }
-
-        .comparison-table td {
-            padding: var(--spacing-md);
-            text-align: left;
-            border-bottom: 1px solid var(--gray-200);
-            vertical-align: middle;
-            font-size: 0.95rem;
-        }
-
-        .comparison-table tbody tr {
-            transition: var(--transition-fast);
-        }
-
-        .comparison-table tbody tr:hover {
-            background: linear-gradient(90deg, rgba(0, 180, 216, 0.1) 0%, transparent 100%);
-            transform: translateX(5px);
-        }
-
-        .db-column {
-            font-weight: 700;
-            color: var(--primary-color);
-        }
-
-        .oscar-col {
-            background: linear-gradient(135deg, rgba(26, 54, 93, 0.08) 0%, rgba(26, 54, 93, 0.03) 100%);
-            border-left: 3px solid var(--primary-color);
-        }
-
-        .copper-col {
-            background: linear-gradient(135deg, rgba(0, 180, 216, 0.08) 0%, rgba(0, 180, 216, 0.03) 100%);
-            border-left: 3px solid var(--accent-color);
-        }
-
-        .star-col {
-            background: linear-gradient(135deg, rgba(56, 161, 105, 0.08) 0%, rgba(56, 161, 105, 0.03) 100%);
-            border-left: 3px solid var(--success-color);
-        }
-
-        .edb-col {
-            background: linear-gradient(135deg, rgba(237, 137, 54, 0.08) 0%, rgba(237, 137, 54, 0.03) 100%);
-            border-left: 3px solid var(--warning-color);
-        }
-
-        .status-badge {
-            padding: 0.375rem 0.75rem;
-            border-radius: var(--radius-lg);
-            font-size: 0.75rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            display: inline-block;
-            letter-spacing: 0.05em;
-            box-shadow: var(--shadow-sm);
-        }
-
-        .status-match {
-            background: var(--gradient-success);
-            color: var(--white);
-        }
-
-        .status-mismatch {
-            background: var(--gradient-error);
-            color: var(--white);
-        }
-
-        .status-missing {
-            background: var(--gradient-warning);
-            color: var(--white);
-        }
-
-        .status-partial {
-            background: linear-gradient(135deg, var(--warning-color) 0%, var(--error-color) 100%);
-            color: var(--white);
-        }
-
-        .status-active {
-            background: var(--gradient-success);
-            color: var(--white);
-        }
-
-        .status-inactive {
-            background: linear-gradient(135deg, var(--gray-600) 0%, var(--gray-500) 100%);
-            color: var(--white);
-
-        .alert {
-            padding: var(--spacing-lg);
-            border-radius: var(--radius-lg);
-            margin-bottom: var(--spacing-lg);
-            border-left: 4px solid;
-        }
-
-        .alert-error {
-            background: rgba(229, 62, 62, 0.1);
-            border-left-color: var(--error-color);
-            color: var(--error-color);
-        }
-
-        .alert-success {
-            background: rgba(56, 161, 105, 0.1);
-            border-left-color: var(--success-color);
-            color: var(--success-color);
-        }
-
-        .loading {
-            display: inline-block;
-            width: 1.25rem;
-            height: 1.25rem;
-            border: 3px solid rgba(255, 255, 255, 0.3);
-            border-top-color: var(--white);
-            border-radius: 50%;
-            animation: spin 0.6s linear infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        @media (max-width: 768px) {
-            .container {
-                padding: 0 var(--spacing-md);
-            }
-            
-            .header-content {
-                flex-direction: column;
-                gap: var(--spacing-md);
-            }
-            
-            .logo h1 {
-                font-size: 1.25rem;
-            }
-            
-            .form-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .results-header {
-                flex-direction: column;
-                gap: var(--spacing-md);
-                align-items: stretch;
-            }
-            
-            .results-actions {
-                justify-content: center;
-                flex-wrap: wrap;
-            }
-            
-            .comparison-table {
-                font-size: 0.875rem;
-            }
-            
-            .comparison-table th,
-            .comparison-table td {
-                padding: var(--spacing-sm);
-            }
-        }
-    </style>
-</head>
-<body>
-    <header class="header">
-        <div class="container">
-            <div class="header-content">
-                <div class="logo">
-                    <i class="fas fa-sync-alt"></i>
-                    <h1>OSCAR Reconcile</h1>
-                </div>
-                <div class="connection-status">
-                    <div class="status-dot"></div>
-                    <span>All Systems Connected</span>
-                </div>
-            </div>
-        </div>
-    </header>
-
-    <main class="main-content">
-        <div class="container">
-            <section class="welcome-section">
-                <div class="welcome-content">
-                    <h2>Data Reconciliation Engine</h2>
-                    <p>OSCAR • CoPPER • STAR • EDB Multi-System Comparison & Validation</p>
-                </div>
-            </section>
-
-            <section class="search-section">
-                <div class="search-card">
-                    <div class="search-header">
-                        <h3><i class="fas fa-search"></i> Reconciliation Parameters</h3>
-                        <p>Search by GUID or by GFID + GUS ID combination</p>
-                    </div>
+            with self.engine.connect() as connection:
+                result = connection.execute(text("SELECT 1 as test"))
+                row = result.fetchone()
+                
+                if row and row[0] == 1:
+                    logger.info(f"{self.instance_name.upper()} connection test successful")
+                    return True
+                else:
+                    logger.error(f"{self.instance_name.upper()} connection test failed")
+                    return False
                     
-                    <form id="reconcile-form">
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="guid">
-                                    <i class="fas fa-key"></i> GUID (12 chars)
-                                </label>
-                                <input type="text" id="guid" name="guid" placeholder="e.g., ABCDEFGH1234" maxlength="12">
-                                <div class="input-info">Global Unique Identifier</div>
-                            </div>
-                        </div>
+        except Exception as e:
+            logger.error(f"{self.instance_name.upper()} connection test failed: {e}")
+            return False
+    
+    def execute_query(self, query: str, params: dict = None) -> List[Dict]:
+        try:
+            with self.engine.connect() as connection:
+                result = connection.execute(text(query), params or {})
+                columns = result.keys()
+                rows = []
+                for row in result:
+                    row_dict = {}
+                    for i, col in enumerate(columns):
+                        value = row[i]
+                        # Convert date objects to string
+                        if hasattr(value, 'isoformat'):
+                            value = value.isoformat()
+                        row_dict[col] = value
+                    rows.append(row_dict)
+                
+                logger.info(f"OSCAR Query returned {len(rows)} rows")
+                if rows:
+                    logger.info(f"Sample row: {rows[0]}")
+                
+                return rows
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            logger.error(f"Query was: {query}")
+            logger.error(f"Params were: {params}")
+            raise
 
-                        <div class="divider">
-                            <span>OR</span>
-                        </div>
 
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="gfid">
-                                    <i class="fas fa-building"></i> GFID (4 chars)
-                                </label>
-                                <input type="text" id="gfid" name="gfid" placeholder="e.g., ABCD" maxlength="4">
-                                <div class="input-info">Globex Firm ID</div>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="gus-id">
-                                    <i class="fas fa-user"></i> GUS ID (5 chars)
-                                </label>
-                                <input type="text" id="gus-id" name="gus_id" placeholder="e.g., ABCDE" maxlength="5">
-                                <div class="input-info">Globex User Signature ID</div>
-                            </div>
-                        </div>
-
-                        <div class="submit-container">
-                            <button type="submit" class="btn-primary" id="submit-btn">
-                                <i class="fas fa-bolt"></i>
-                                <span>Execute Reconciliation</span>
-                            </button>
-                        </div>
-                    </form>
-                </div>
-            </section>
-
-            <section class="results-section" id="results-section">
-                <div class="results-header">
-                    <h3><i class="fas fa-chart-line"></i> Reconciliation Results</h3>
-                    <div class="results-actions">
-                        <button class="btn-secondary" id="export-btn">
-                            <i class="fas fa-download"></i> Export JSON
-                        </button>
-                        <button class="btn-secondary" id="clear-results-btn">
-                            <i class="fas fa-times-circle"></i> Clear Results
-                        </button>
-                    </div>
-                </div>
-
-                <div id="error-container"></div>
-
-                <div class="scenario-card" id="scenario-card">
-                    <h4><i class="fas fa-lightbulb"></i> Detected Scenario & Recommended Action</h4>
-                    <div class="scenario-content">
-                        <div class="scenario-text" id="scenario-text"></div>
-                        <div class="action-text" id="action-text"></div>
-                    </div>
-                </div>
-
-                <div class="comparison-tables">
-                    <div class="table-section">
-                        <div class="table-header">
-                            <h4><i class="fas fa-database"></i> OSCAR ↔ CoPPER ↔ EDB Comparison</h4>
-                        </div>
-                        <div class="table-container">
-                            <table class="comparison-table" id="edb-table">
-                                <thead>
-                                    <tr>
-                                        <th>Field</th>
-                                        <th class="oscar-col">OSCAR</th>
-                                        <th class="copper-col">CoPPER</th>
-                                        <th class="edb-col">EDB</th>
-                                        <th>Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="edb-table-body">
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <div class="table-section">
-                        <div class="table-header">
-                            <h4><i class="fas fa-database"></i> OSCAR ↔ CoPPER ↔STAR Comparison</h4>
-                        </div>
-                        <div class="table-container">
-                            <table class="comparison-table" id="star-table">
-                                <thead>
-                                    <tr>
-                                        <th>Field</th>
-                                        <th class="oscar-col">OSCAR</th>
-                                        <th class="copper-col">CoPPER</th>
-                                        <th class="star-col">STAR</th>
-                                        <th>Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="star-table-body">
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-            </section>
-        </div>
-    </main>
-
-    <script>
-        let currentResults = null;
-
-        // CORRECTED Field mappings - reflecting actual database schemas
-        const FIELD_MAPPINGS = {
-            edb: {
-                // Fields that ACTUALLY exist in each database for EDB comparison
-                oscar: {
-                    guid: true,
-                    gfid: true, 
-                    gus_id: true,
-                    namespace: true,
-                    status: true
-                },
-                copper: {
-                    guid: true,
-                    gfid: true,
-                    gus_id: true,
-                    eff_to: true,
-                    status: true
-                },
-                edb: {
-                    guid: true,
-                    gfid: true,
-                    gus_id: true,
-                    eff_to: true,
-                    status: true
-                }
-            },
-            star: {
-                // Fields that ACTUALLY exist in each database for STAR comparison
-                oscar: {
-                    guid: true,
-                    gfid: true,
-                    gus_id: true,
-                    namespace: true,
-                    status: true
-                },
-                copper: {
-                    guid: true,      // CoPPER HAS GUID in STAR comparison
-                    gfid: true,
-                    gus_id: true,
-                    eff_to: true,
-                    exch_id: true,
-                    status: true
-                },
-                star: {
-                    guid: false,     // STAR does NOT have GUID
-                    gfid: true,
-                    gfid_description: true,
-                    exchange_id: true
-                }
-            }
-        };
-
-        const FIELD_LABELS = {
-            'guid': 'GUID',
-            'gfid': 'GFID',
-            'gus_id': 'GUS ID',
-            'status': 'Status',
-            'eff_to': 'Expiry Date',
-            'namespace': 'Namespace',
-            'exch_id': 'Exchange ID',
-            'exchange_id': 'Exchange ID',
-            'gfid_description': 'GFID Description'
-        };
-
-        // Define display order for fields
-        const FIELD_ORDER = ['guid', 'gfid', 'gus_id', 'namespace', 'eff_to', 'exch_id', 'exchange_id', 'gfid_description', 'status'];
-
-        document.addEventListener('DOMContentLoaded', function() {
-            const form = document.getElementById('reconcile-form');
-            const resultsSection = document.getElementById('results-section');
-            const submitBtn = document.getElementById('submit-btn');
+class OracleConnector:
+    """Oracle DB connector for CoPPER, EDB, and STAR"""
+    
+    def __init__(self, instance_name: str):
+        if instance_name not in ORACLE_INSTANCES:
+            raise ValueError(f"Unknown Oracle instance: {instance_name}")
+        
+        self.instance_name = instance_name
+        self.config = ORACLE_INSTANCES[instance_name]
+        self.engine = None
+        self._initialize_connection()
+    
+    def get_tns_string_from_ldap_url(self, ldap_url: str) -> Optional[str]:
+        try:
+            pattern = r"^ldap://(.+)/(.+),(cn=OracleContext.*)$"
+            match = re.match(pattern, ldap_url)
             
-            const guidInput = document.getElementById('guid');
-            const gfidInput = document.getElementById('gfid');
-            const gusIdInput = document.getElementById('gus-id');
-
-            // Input locking logic - mutual exclusivity
-            guidInput.addEventListener('input', function() {
-                if (this.value.trim().length > 0) {
-                    gfidInput.disabled = true;
-                    gusIdInput.disabled = true;
-                    gfidInput.value = '';
-                    gusIdInput.value = '';
-                } else {
-                    gfidInput.disabled = false;
-                    gusIdInput.disabled = false;
-                }
-            });
-
-            gfidInput.addEventListener('input', function() {
-                if (this.value.trim().length > 0) {
-                    guidInput.disabled = true;
-                    guidInput.value = '';
-                } else if (gusIdInput.value.trim().length === 0) {
-                    guidInput.disabled = false;
-                }
-            });
-
-            gusIdInput.addEventListener('input', function() {
-                if (this.value.trim().length > 0) {
-                    guidInput.disabled = true;
-                    guidInput.value = '';
-                } else if (gfidInput.value.trim().length === 0) {
-                    guidInput.disabled = false;
-                }
-            });
+            if not match:
+                return None
             
-            form.addEventListener('submit', async function(e) {
-                e.preventDefault();
+            ldap_server, db, ora_context = match.groups()
+            
+            server = Server(ldap_server)
+            conn = Connection(server)
+            conn.bind()
+            
+            conn.search(ora_context, f"(cn={db})", attributes=['orclNetDescString'])
+            
+            if conn.entries:
+                tns = conn.entries[0].orclNetDescString.value
+                return tns
+            else:
+                return None
                 
-                const guid = guidInput.value.trim();
-                const gfid = gfidInput.value.trim();
-                const gus_id = gusIdInput.value.trim();
+        except Exception as e:
+            logger.error(f"LDAP lookup failed: {e}")
+            return None
+    
+    def _initialize_connection(self):
+        try:
+            logger.info(f"Initializing {self.config['description']} connector")
+            
+            user = self.config['user']
+            password = self.config['password']
+            url = self.config['url']
+            
+            tns_string = self.get_tns_string_from_ldap_url(url)
+            
+            if tns_string:
+                self.engine = sqlalchemy.create_engine(
+                    f"oracle+oracledb://{user}:{password}@{tns_string}"
+                )
+                logger.info(f"{self.instance_name.upper()} engine created successfully")
+            else:
+                raise Exception("Failed to retrieve TNS string from LDAP")
                 
-                // Validation
-                if (!guid && (!gfid || !gus_id)) {
-                    showError('Please provide either GUID or both GFID and GUS ID');
-                    return;
-                }
-
-                if (guid && (gfid || gus_id)) {
-                    showError('Please provide either GUID or GFID+GUS ID, not both');
-                    return;
-                }
-
-                if ((gfid && !gus_id) || (!gfid && gus_id)) {
-                    showError('Both GFID and GUS ID are required when not using GUID');
-                    return;
-                }
+        except Exception as e:
+            logger.error(f"{self.instance_name.upper()} initialization failed: {e}")
+            raise
+    
+    def test_connection(self) -> bool:
+        try:
+            if not self.engine:
+                logger.error("Database engine not initialized")
+                return False
+            
+            with self.engine.connect() as connection:
+                result = connection.execute(text("SELECT CURRENT_DATE FROM DUAL"))
+                row = result.fetchone()
                 
-                submitBtn.disabled = true;
-                submitBtn.innerHTML = '<div class="loading"></div><span>Processing...</span>';
-                
-                try {
-                    const response = await fetch('/api/reconcile', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ guid, gfid, gus_id })
-                    });
+                if row:
+                    logger.info(f"{self.instance_name.upper()} connection test successful")
+                    return True
+                else:
+                    logger.error(f"{self.instance_name.upper()} connection test failed")
+                    return False
                     
-                    const data = await response.json();
-                    
-                    if (!response.ok) {
-                        throw new Error(data.error || 'Reconciliation failed');
-                    }
-                    
-                    currentResults = data;
-                    displayResults(data);
-                    resultsSection.classList.add('show');
-                    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                    
-                } catch (error) {
-                    showError(error.message);
-                    console.error('Error details:', error);
-                } finally {
-                    submitBtn.disabled = false;
-                    submitBtn.innerHTML = '<i class="fas fa-bolt"></i><span>Execute Reconciliation</span>';
-                }
-            });
+        except Exception as e:
+            logger.error(f"{self.instance_name.upper()} connection test failed: {e}")
+            return False
+    
+    def execute_query(self, query: str, params: dict = None) -> List[Dict]:
+        try:
+            with self.engine.connect() as connection:
+                result = connection.execute(text(query), params or {})
+                columns = result.keys()
+                rows = []
+                for row in result:
+                    row_dict = {}
+                    for i, col in enumerate(columns):
+                        value = row[i]
+                        # Convert date objects to string
+                        if hasattr(value, 'isoformat'):
+                            value = value.isoformat()
+                        row_dict[col] = value
+                    rows.append(row_dict)
+                
+                logger.info(f"{self.instance_name.upper()} Query returned {len(rows)} rows")
+                if rows:
+                    logger.info(f"Sample row: {rows[0]}")
+                
+                return rows
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}")
+            logger.error(f"Query was: {query}")
+            logger.error(f"Params were: {params}")
+            raise
+
+
+class ReconciliationEngine:
+    """Main reconciliation logic"""
+    
+    def __init__(self):
+        self.oscar_conn = None
+        self.copper_conn = None
+        self.edb_conn = None
+        self.star_conn = None
+        self._initialize_connections()
+    
+    def _initialize_connections(self):
+        try:
+            self.oscar_conn = DatabaseConnector('oscar')
+            self.copper_conn = OracleConnector('copper')
+            self.edb_conn = OracleConnector('edb')
+            self.star_conn = OracleConnector('star')
             
-            document.getElementById('clear-results-btn').addEventListener('click', function() {
-                resultsSection.classList.remove('show');
-                form.reset();
-                guidInput.disabled = false;
-                gfidInput.disabled = false;
-                gusIdInput.disabled = false;
-                currentResults = null;
-                clearError();
-            });
+            # Test all connections
+            if not all([
+                self.oscar_conn.test_connection(),
+                self.copper_conn.test_connection(),
+                self.edb_conn.test_connection(),
+                self.star_conn.test_connection()
+            ]):
+                raise Exception("One or more database connections failed")
+                
+            logger.info("All database connections established successfully")
             
-            document.getElementById('export-btn').addEventListener('click', function() {
-                if (currentResults) {
-                    downloadJSON(currentResults, `oscar_reconciliation_${new Date().toISOString().split('T')[0]}.json`);
-                }
-            });
-        });
+        except Exception as e:
+            logger.error(f"Failed to initialize connections: {e}")
+            raise
+    
+    def get_oscar_data_by_guid(self, guid: str) -> List[Dict]:
+        """Get OSCAR data by GUID - FIXED VERSION"""
+        query = """
+        SELECT
+            GUID,
+            (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', guses.XML))[1]::text as gfid,
+            (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', guses.XML))[1]::text as gus_id,
+            (xpath('//globexUserSignature/globexUserSignatureInfo/exchange/text()', guses.XML))[1]::text as exchange,
+            namespace,
+            CASE
+                WHEN (xpath('//globexUserSignature/globexUserSignatureInfo/expDate/text()', guses.xml))[1]::text IS NULL
+                THEN 'MISSING'
+                WHEN TO_DATE((xpath('//globexUserSignature/globexUserSignatureInfo/expDate/text()', guses.xml))[1]::text, 'DD-MON-YYYY') >= CURRENT_DATE
+                THEN 'ACTIVE'
+                ELSE 'INACTIVE'
+            END as status
+        FROM dv01cosrs.active_xml_data_store guses
+        WHERE guses.GUID = :guid
+        AND (guses.namespace = 'GlobexUserSignature')
+        LIMIT 1
+        """
         
-        function displayResults(data) {
-            clearError();
+        logger.info(f"Executing OSCAR query with GUID: {guid}")
+        results = self.oscar_conn.execute_query(query, {'guid': guid})
+        logger.info(f"OSCAR results: {results}")
+        return results
+    
+    def get_oscar_data_by_gfid_gusid(self, gfid: str, gus_id: str) -> List[Dict]:
+        """Get OSCAR data by GFID and GUS_ID - FIXED VERSION"""
+        query = """
+        SELECT
+            guid,
+            (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', guses.XML))[1]::text as gfid,
+            (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', guses.XML))[1]::text as gus_id,
+            (xpath('//globexUserSignature/globexUserSignatureInfo/exchange/text()', guses.XML))[1]::text as exchange,
+            namespace,
+            CASE
+                WHEN (xpath('//globexUserSignature/globexUserSignatureInfo/expDate/text()', guses.xml))[1]::text IS NULL
+                THEN 'MISSING'
+                WHEN TO_DATE((xpath('//globexUserSignature/globexUserSignatureInfo/expDate/text()', guses.xml))[1]::text, 'DD-MON-YYYY') >= CURRENT_DATE
+                THEN 'ACTIVE'
+                ELSE 'INACTIVE'
+            END as status
+        FROM dv01cosrs.active_xml_data_store guses
+        WHERE (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', guses.XML))[1]::text = :gfid
+        AND (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', guses.XML))[1]::text = :gus_id
+        AND namespace = 'GlobexUserSignature'
+        LIMIT 1
+        """
+        
+        logger.info(f"Executing OSCAR query with GFID: {gfid}, GUS_ID: {gus_id}")
+        results = self.oscar_conn.execute_query(query, {'gfid': gfid, 'gus_id': gus_id})
+        logger.info(f"OSCAR results: {results}")
+        return results
+    
+    def get_copper_data_by_guid(self, guid: str) -> List[Dict]:
+        query = """
+        SELECT
+            guid,
+            gpid_id as gus_id,
+            gfid_id as gfid,
+            eff_to,
+            CASE
+                WHEN eff_to IS NULL THEN 'MISSING'
+                WHEN eff_to >= CURRENT_DATE THEN 'ACTIVE'
+                ELSE 'INACTIVE'
+            END as status
+        FROM QF44CCRDO.trd_gpid
+        WHERE guid = :guid
+        """
+        
+        logger.info(f"Executing CoPPER query with GUID: {guid}")
+        results = self.copper_conn.execute_query(query, {'guid': guid})
+        logger.info(f"CoPPER results: {results}")
+        return results
+    
+    def get_copper_data_by_gfid_gusid(self, gfid: str, gus_id: str) -> List[Dict]:
+        query = """
+        SELECT
+            guid,
+            gpid_id as gus_id,
+            gfid_id as gfid,
+            eff_to,
+            exch_id,
+            CASE
+                WHEN eff_to IS NULL THEN 'MISSING'
+                WHEN eff_to >= CURRENT_DATE THEN 'ACTIVE'
+                ELSE 'INACTIVE'
+            END as status
+        FROM QF44CCRDO.trd_gpid
+        WHERE gfid_id = :gfid AND gpid_id = :gus_id
+        """
+        
+        logger.info(f"Executing CoPPER query with GFID: {gfid}, GUS_ID: {gus_id}")
+        results = self.copper_conn.execute_query(query, {'gfid': gfid, 'gus_id': gus_id})
+        logger.info(f"CoPPER results: {results}")
+        return results
+    
+    def get_edb_data(self, gfid: str, gus_id: str) -> List[Dict]:
+        query = """
+        SELECT
+            guid,
+            gpid_id as gus_id,
+            gfid_id as gfid,
+            eff_to,
+            CASE
+                WHEN eff_to IS NULL THEN 'MISSING'
+                WHEN eff_to >= CURRENT_DATE THEN 'ACTIVE'
+                ELSE 'INACTIVE'
+            END as status
+        FROM DV02CEDBO.trd_gpid
+        WHERE gfid_id = :gfid AND gpid_id = :gus_id
+        """
+        
+        logger.info(f"Executing EDB query with GFID: {gfid}, GUS_ID: {gus_id}")
+        results = self.edb_conn.execute_query(query, {'gfid': gfid, 'gus_id': gus_id})
+        logger.info(f"EDB results: {results}")
+        return results
+    
+    def get_star_data(self, gfid: str) -> List[Dict]:
+        query = """
+        SELECT gfid, GFID_DESCRIPTION, exchange_id
+        FROM ebs_gfid
+        WHERE gfid = :gfid
+        
+        UNION ALL
+        
+        SELECT gfid, GFID_DESCRIPTION, gfid_type as exchange_id
+        FROM bmc_gfid
+        WHERE gfid = :gfid
+        """
+        
+        logger.info(f"Executing STAR query with GFID: {gfid}")
+        results = self.star_conn.execute_query(query, {'gfid': gfid})
+        logger.info(f"STAR results: {results}")
+        return results
+    
+    def determine_scenario(self, oscar_status: str, copper_status: str, 
+                          oscar_data: Dict, copper_data: Dict) -> Tuple[str, str]:
+        """Determine which scenario applies and return scenario name and recommended action"""
+        
+        # Check if data exists
+        oscar_exists = bool(oscar_data)
+        copper_exists = bool(copper_data)
+        
+        if not oscar_exists and not copper_exists:
+            return "No Data", "No records found in either OSCAR or CoPPER"
+        
+        if not copper_exists:
+            if oscar_status == 'ACTIVE':
+                return "Scenario 2.4", "OSCAR Active GUID is not present in CoPPER - Check why it is missing and take appropriate action"
+            elif oscar_status == 'INACTIVE':
+                return "Scenario 2.3", "OSCAR Expired GUID is missing in CoPPER - Run Sync FLAG to N Job"
+        
+        if not oscar_exists and copper_exists:
+            return "Data Mismatch", "Record exists in CoPPER but not in OSCAR - Investigate data inconsistency"
+        
+        # Both exist - compare statuses
+        if oscar_status == 'INACTIVE' and copper_status == 'INACTIVE':
+            # Check if GFID and GUS_ID match
+            if oscar_data.get('gfid') == copper_data.get('gfid') and \
+               oscar_data.get('gus_id') == copper_data.get('gus_id'):
+                return "Scenario 2.1", "Both Expired with same GFID and GUS ID - Run MASS SYNC job and then run Sync FLAG to N Job"
+            else:
+                return "Scenario 2.1 (Mismatch)", "Both Expired but GFID/GUS_ID mismatch - Verify data integrity before sync"
+        
+        if oscar_status == 'INACTIVE' and copper_status == 'ACTIVE':
+            # Check if present with different GUID
+            if oscar_data.get('gfid') != copper_data.get('gfid') or \
+               oscar_data.get('gus_id') != copper_data.get('gus_id'):
+                return "Scenario 2.2", "OSCAR expired, CoPPER active with different GUID and GFID/GUS combination - Run Sync FLAG to N Job"
+            else:
+                return "Scenario 2.2 (Variant)", "OSCAR expired but CoPPER active - Run Sync FLAG to N Job"
+        
+        if oscar_status == 'ACTIVE' and copper_status == 'ACTIVE':
+            # Verify all fields match
+            if oscar_data.get('guid') == copper_data.get('guid') and \
+               oscar_data.get('gfid') == copper_data.get('gfid') and \
+               oscar_data.get('gus_id') == copper_data.get('gus_id'):
+                return "Match", "All fields match - No action required"
+            else:
+                return "Mismatch", "Active in both but data mismatch - Verify and reconcile data"
+        
+        return "Unknown Scenario", "Unable to determine scenario - Manual review required"
+    
+    def perform_reconciliation(self, guid: str = None, gfid: str = None, 
+                              gus_id: str = None) -> Dict:
+        """Main reconciliation function"""
+        
+        try:
+            result = {
+                'timestamp': datetime.now().isoformat(),
+                'search_criteria': {},
+                'oscar_copper_edb': {},
+                'oscar_copper_star': {},
+                'summary': {},
+                'scenario': '',
+                'recommended_action': ''
+            }
             
-            // Display scenario with enhanced styling
-            const scenarioElement = document.getElementById('scenario-text');
-            const actionElement = document.getElementById('action-text');
+            # Determine search mode
+            if guid:
+                result['search_criteria']['type'] = 'guid'
+                result['search_criteria']['guid'] = guid
+                
+                # Get OSCAR data
+                oscar_data = self.get_oscar_data_by_guid(guid)
+                oscar_record = oscar_data[0] if oscar_data else {}
+                
+                # Get CoPPER data
+                copper_data = self.get_copper_data_by_guid(guid)
+                copper_record = copper_data[0] if copper_data else {}
+                
+            elif gfid and gus_id:
+                result['search_criteria']['type'] = 'gfid_gusid'
+                result['search_criteria']['gfid'] = gfid
+                result['search_criteria']['gus_id'] = gus_id
+                
+                # Get OSCAR data
+                oscar_data = self.get_oscar_data_by_gfid_gusid(gfid, gus_id)
+                oscar_record = oscar_data[0] if oscar_data else {}
+                
+                # Get CoPPER data
+                copper_data = self.get_copper_data_by_gfid_gusid(gfid, gus_id)
+                copper_record = copper_data[0] if copper_data else {}
+                
+            else:
+                return {
+                    'error': 'Invalid search criteria. Provide either GUID or both GFID and GUS_ID',
+                    'timestamp': datetime.now().isoformat()
+                }
             
-            scenarioElement.innerHTML = `<strong>📋 Scenario:</strong> ${data.scenario}`;
-            actionElement.innerHTML = `<strong>⚡ Recommended Action:</strong><br>${data.recommended_action}`;
+            logger.info(f"OSCAR Record: {oscar_record}")
+            logger.info(f"CoPPER Record: {copper_record}")
             
-            // Display tables with only relevant fields
-            displayEDBTable(data.oscar_copper_edb);
-            displaySTARTable(data.oscar_copper_star);
+            # Determine scenario
+            oscar_status = oscar_record.get('status', 'MISSING')
+            copper_status = copper_record.get('status', 'MISSING')
+            scenario, action = self.determine_scenario(
+                oscar_status, copper_status, oscar_record, copper_record
+            )
+            
+            result['scenario'] = scenario
+            result['recommended_action'] = action
+            
+            # Get GFID and GUS_ID for EDB and STAR queries
+            # Prefer CoPPER data if available
+            query_gfid = copper_record.get('gfid') or oscar_record.get('gfid')
+            query_gus_id = copper_record.get('gus_id') or oscar_record.get('gus_id')
+            
+            # OSCAR-CoPPER-EDB comparison
+            edb_data = []
+            if query_gfid and query_gus_id:
+                edb_data = self.get_edb_data(query_gfid, query_gus_id)
+            
+            edb_record = edb_data[0] if edb_data else {}
+            
+            result['oscar_copper_edb'] = {
+                'oscar': oscar_record,
+                'copper': copper_record,
+                'edb': edb_record,
+                'comparison': {
+                    'oscar_copper_match': self._compare_records(oscar_record, copper_record),
+                    'copper_edb_match': self._compare_records(copper_record, edb_record),
+                    'oscar_status': oscar_status,
+                    'copper_status': copper_status,
+                    'edb_status': edb_record.get('status', 'MISSING')
+                }
+            }
+            
+            # OSCAR-CoPPER-STAR comparison
+            star_data = []
+            if query_gfid:
+                star_data = self.get_star_data(query_gfid)
+            
+            star_record = star_data[0] if star_data else {}
+            
+            result['oscar_copper_star'] = {
+                'oscar': oscar_record,
+                'copper': copper_record,
+                'star': star_record,
+                'comparison': {
+                    'oscar_copper_match': self._compare_records(oscar_record, copper_record),
+                    'copper_gfid_in_star': bool(star_record),
+                    'oscar_status': oscar_status,
+                    'copper_status': copper_status,
+                    'star_exists': bool(star_record)
+                }
+            }
+            
+            # Calculate summary
+            result['summary'] = self._calculate_summary(result)
+            
+            logger.info(f"Reconciliation result: {result}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Reconciliation failed: {e}")
+            logger.error(traceback.format_exc())
+            return {
+                'error': str(e),
+                'timestamp': datetime.now().isoformat(),
+                'traceback': traceback.format_exc()
+            }
+    
+    def _compare_records(self, record1: Dict, record2: Dict) -> str:
+        """Compare two records and return match status"""
+        if not record1 and not record2:
+            return 'BOTH_MISSING'
+        if not record1:
+            return 'FIRST_MISSING'
+        if not record2:
+            return 'SECOND_MISSING'
+        
+        # Compare key fields
+        key_fields = ['guid', 'gfid', 'gus_id']
+        matches = []
+        
+        for field in key_fields:
+            val1 = record1.get(field)
+            val2 = record2.get(field)
+            if val1 and val2:
+                matches.append(str(val1).strip().upper() == str(val2).strip().upper())
+        
+        if all(matches) and len(matches) > 0:
+            return 'MATCH'
+        elif any(matches):
+            return 'PARTIAL_MATCH'
+        else:
+            return 'MISMATCH'
+    
+    def _calculate_summary(self, result: Dict) -> Dict:
+        """Calculate summary statistics"""
+        summary = {
+            'total_comparisons': 2,
+            'matches': 0,
+            'mismatches': 0,
+            'missing': 0
         }
         
-        function displayEDBTable(data) {
-            const tbody = document.getElementById('edb-table-body');
-            tbody.innerHTML = '';
-            
-            const fieldMap = FIELD_MAPPINGS.edb;
-            
-            // Collect all possible fields from all three databases
-            const allFieldsSet = new Set();
-            Object.keys(fieldMap.oscar).forEach(f => allFieldsSet.add(f));
-            Object.keys(fieldMap.copper).forEach(f => allFieldsSet.add(f));
-            Object.keys(fieldMap.edb).forEach(f => allFieldsSet.add(f));
-            
-            // Sort fields by defined order
-            const allFields = FIELD_ORDER.filter(f => allFieldsSet.has(f));
-            
-            // Display each field
-            allFields.forEach(field => {
-                // Check if field exists in each database
-                const oscarHas = fieldMap.oscar[field] === true;
-                const copperHas = fieldMap.copper[field] === true;
-                const edbHas = fieldMap.edb[field] === true;
-                
-                // Skip if field doesn't exist in ANY database
-                if (!oscarHas && !copperHas && !edbHas) {
-                    return;
-                }
-                
-                // Get actual values from data
-                const oscarVal = oscarHas && data.oscar ? data.oscar[field] : null;
-                const copperVal = copperHas && data.copper ? data.copper[field] : null;
-                const edbVal = edbHas && data.edb ? data.edb[field] : null;
-                
-                const status = getFieldStatus(oscarVal, copperVal, edbVal, oscarHas, copperHas, edbHas);
-                
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td class="db-column">${FIELD_LABELS[field] || field.toUpperCase()}</td>
-                    <td class="oscar-col">${oscarHas ? formatValue(oscarVal, field) : '<span style="color: var(--gray-400); font-style: italic;">—</span>'}</td>
-                    <td class="copper-col">${copperHas ? formatValue(copperVal, field) : '<span style="color: var(--gray-400); font-style: italic;">—</span>'}</td>
-                    <td class="edb-col">${edbHas ? formatValue(edbVal, field) : '<span style="color: var(--gray-400); font-style: italic;">—</span>'}</td>
-                    <td>${status}</td>
-                `;
-                
-                tbody.appendChild(row);
-            });
-            
-            // Add overall comparison row
-            const summaryRow = document.createElement('tr');
-            summaryRow.style.borderTop = '3px solid var(--accent-color)';
-            summaryRow.style.fontWeight = '700';
-            summaryRow.innerHTML = `
-                <td class="db-column" style="background: var(--gray-100);">OVERALL STATUS</td>
-                <td class="oscar-col" style="background: rgba(26, 54, 93, 0.15);">${formatValue(data.comparison.oscar_status, 'status')}</td>
-                <td class="copper-col" style="background: rgba(0, 180, 216, 0.15);">${formatValue(data.comparison.copper_status, 'status')}</td>
-                <td class="edb-col" style="background: rgba(237, 137, 54, 0.15);">${formatValue(data.comparison.edb_status, 'status')}</td>
-                <td>${getOverallStatus(data.comparison.oscar_copper_match, data.comparison.copper_edb_match)}</td>
-            `;
-            tbody.appendChild(summaryRow);
-        }
+        # Check OSCAR-CoPPER-EDB
+        edb_comparison = result['oscar_copper_edb']['comparison']
+        if edb_comparison['oscar_copper_match'] == 'MATCH' and \
+           edb_comparison['copper_edb_match'] == 'MATCH':
+            summary['matches'] += 1
+        elif 'MISSING' in edb_comparison['oscar_copper_match'] or \
+             'MISSING' in edb_comparison['copper_edb_match']:
+            summary['missing'] += 1
+        else:
+            summary['mismatches'] += 1
         
-        function displaySTARTable(data) {
-            const tbody = document.getElementById('star-table-body');
-            tbody.innerHTML = '';
-            
-            const fieldMap = FIELD_MAPPINGS.star;
-            
-            // Collect all possible fields from all three databases
-            const allFieldsSet = new Set();
-            Object.keys(fieldMap.oscar).forEach(f => allFieldsSet.add(f));
-            Object.keys(fieldMap.copper).forEach(f => allFieldsSet.add(f));
-            Object.keys(fieldMap.star).forEach(f => allFieldsSet.add(f));
-            
-            // Sort fields by defined order
-            const allFields = FIELD_ORDER.filter(f => allFieldsSet.has(f));
-            
-            // Display each field
-            allFields.forEach(field => {
-                // Check if field exists in each database
-                const oscarHas = fieldMap.oscar[field] === true;
-                const copperHas = fieldMap.copper[field] === true;
-                const starHas = fieldMap.star[field] === true;
-                
-                // Skip if field doesn't exist in ANY database
-                if (!oscarHas && !copperHas && !starHas) {
-                    return;
-                }
-                
-                // Get actual values from data
-                const oscarVal = oscarHas && data.oscar ? data.oscar[field] : null;
-                const copperVal = copperHas && data.copper ? data.copper[field] : null;
-                const starVal = starHas && data.star ? data.star[field] : null;
-                
-                const status = getFieldStatus(oscarVal, copperVal, starVal, oscarHas, copperHas, starHas);
-                
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td class="db-column">${FIELD_LABELS[field] || field.toUpperCase()}</td>
-                    <td class="oscar-col">${oscarHas ? formatValue(oscarVal, field) : '<span style="color: var(--gray-400); font-style: italic;">—</span>'}</td>
-                    <td class="copper-col">${copperHas ? formatValue(copperVal, field) : '<span style="color: var(--gray-400); font-style: italic;">—</span>'}</td>
-                    <td class="star-col">${starHas ? formatValue(starVal, field) : '<span style="color: var(--gray-400); font-style: italic;">—</span>'}</td>
-                    <td>${status}</td>
-                `;
-                
-                tbody.appendChild(row);
-            });
-            
-            // Add overall comparison row
-            const summaryRow = document.createElement('tr');
-            summaryRow.style.borderTop = '3px solid var(--accent-color)';
-            summaryRow.style.fontWeight = '700';
-            summaryRow.innerHTML = `
-                <td class="db-column" style="background: var(--gray-100);">OVERALL STATUS</td>
-                <td class="oscar-col" style="background: rgba(26, 54, 93, 0.15);">${formatValue(data.comparison.oscar_status, 'status')}</td>
-                <td class="copper-col" style="background: rgba(0, 180, 216, 0.15);">${formatValue(data.comparison.copper_status, 'status')}</td>
-                <td class="star-col" style="background: rgba(56, 161, 105, 0.15);">${data.comparison.star_exists ? '<span class="status-badge status-active">EXISTS</span>' : '<span class="status-badge status-missing">NOT FOUND</span>'}</td>
-                <td>${getOverallStatus(data.comparison.oscar_copper_match, data.comparison.copper_gfid_in_star ? 'MATCH' : 'MISSING')}</td>
-            `;
-            tbody.appendChild(summaryRow);
-        }
+        # Check OSCAR-CoPPER-STAR
+        star_comparison = result['oscar_copper_star']['comparison']
+        if star_comparison['oscar_copper_match'] == 'MATCH' and \
+           star_comparison['copper_gfid_in_star']:
+            summary['matches'] += 1
+        elif 'MISSING' in star_comparison['oscar_copper_match'] or \
+             not star_comparison['copper_gfid_in_star']:
+            summary['missing'] += 1
+        else:
+            summary['mismatches'] += 1
         
-        function formatValue(value, field) {
-            // Handle null, undefined, empty string
-            if (value === null || value === undefined || value === '') {
-                return '<span style="color: var(--gray-500); font-weight: 600;">NULL</span>';
-            }
-            
-            // Format status badges
-            if (field === 'status') {
-                const valueLower = String(value).toLowerCase();
-                let statusClass = '';
-                
-                if (valueLower.includes('active')) {
-                    statusClass = 'status-active';
-                } else if (valueLower.includes('inactive') || valueLower.includes('expired')) {
-                    statusClass = 'status-inactive';
-                } else if (valueLower.includes('missing')) {
-                    statusClass = 'status-missing';
-                }
-                
-                return `<span class="status-badge ${statusClass}">${value}</span>`;
-            }
-            
-            // Format dates
-            if (field === 'eff_to' && value) {
-                try {
-                    const date = new Date(value);
-                    if (!isNaN(date.getTime())) {
-                        return `<span style="font-family: monospace; font-weight: 600; color: var(--gray-700);">${date.toISOString().split('T')[0]}</span>`;
-                    }
-                } catch (e) {
-                    // Return as-is if date parsing fails
-                }
-            }
-            
-            // Highlight key identifier fields
-            if (field === 'guid' || field === 'gfid' || field === 'gus_id') {
-                return `<span style="font-weight: 700; color: var(--primary-color); font-family: monospace;">${value}</span>`;
-            }
-            
-            // Default return
-            return `<span style="color: var(--gray-800);">${value}</span>`;
-        }
+        return summary
+
+
+# Initialize reconciliation engine
+recon_engine = None
+
+def get_recon_engine():
+    global recon_engine
+    if recon_engine is None:
+        recon_engine = ReconciliationEngine()
+    return recon_engine
+
+
+# Flask routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/api/reconcile', methods=['POST'])
+def reconcile():
+    try:
+        data = request.get_json()
         
-        function getFieldStatus(val1, val2, val3, has1, has2, has3) {
-            // Collect values only from databases that should have this field
-            const values = [];
-            const hasField = [];
-            
-            if (has1) {
-                hasField.push('db1');
-                if (val1 !== null && val1 !== undefined && val1 !== '') {
-                    values.push(String(val1).trim().toUpperCase());
-                }
-            }
-            
-            if (has2) {
-                hasField.push('db2');
-                if (val2 !== null && val2 !== undefined && val2 !== '') {
-                    values.push(String(val2).trim().toUpperCase());
-                }
-            }
-            
-            if (has3) {
-                hasField.push('db3');
-                if (val3 !== null && val3 !== undefined && val3 !== '') {
-                    values.push(String(val3).trim().toUpperCase());
-                }
-            }
-            
-            const expectedCount = hasField.length;
-            
-            // If field doesn't exist in any database
-            if (expectedCount === 0) {
-                return '<span style="color: var(--gray-400); font-style: italic;">—</span>';
-            }
-            
-            // If no values found where they should exist
-            if (values.length === 0) {
-                return '<span class="status-badge status-missing">ALL NULL</span>';
-            }
-            
-            // If we have fewer values than expected
-            if (values.length < expectedCount) {
-                return '<span class="status-badge status-partial">PARTIAL</span>';
-            }
-            
-            // Check if all values match
-            const uniqueValues = [...new Set(values)];
-            
-            if (uniqueValues.length === 1) {
-                return '<span class="status-badge status-match">✓ MATCH</span>';
-            } else {
-                return '<span class="status-badge status-mismatch">✗ MISMATCH</span>';
-            }
-        }
+        guid = data.get('guid', '').strip()
+        gfid = data.get('gfid', '').strip()
+        gus_id = data.get('gus_id', '').strip()
         
-        function getOverallStatus(match1, match2) {
-            const isMatch1 = match1 === 'MATCH';
-            const isMatch2 = match2 === 'MATCH' || match2 === true;
-            const isMissing1 = match1 && (match1.includes('MISSING') || match1.includes('FIRST_MISSING') || match1.includes('SECOND_MISSING'));
-            const isMissing2 = match2 === 'MISSING' || match2 === false;
-            
-            if (isMatch1 && isMatch2) {
-                return '<span class="status-badge status-match" style="font-size: 0.875rem; padding: 0.5rem 1rem;">✓ FULL MATCH</span>';
-            } else if (isMissing1 || isMissing2) {
-                return '<span class="status-badge status-missing" style="font-size: 0.875rem; padding: 0.5rem 1rem;">⚠ DATA MISSING</span>';
-            } else {
-                return '<span class="status-badge status-mismatch" style="font-size: 0.875rem; padding: 0.5rem 1rem;">✗ MISMATCH</span>';
+        logger.info(f"Reconciliation request: guid={guid}, gfid={gfid}, gus_id={gus_id}")
+        
+        # Validate input
+        if not guid and not (gfid and gus_id):
+            return jsonify({
+                'error': 'Please provide either GUID or both GFID and GUS_ID'
+            }), 400
+        
+        # Get reconciliation engine
+        engine = get_recon_engine()
+        
+        # Perform reconciliation
+        result = engine.perform_reconciliation(
+            guid=guid if guid else None,
+            gfid=gfid if gfid else None,
+            gus_id=gus_id if gus_id else None
+        )
+        
+        if 'error' in result:
+            logger.error(f"Reconciliation error: {result}")
+            return jsonify(result), 500
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        logger.error(f"API error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    try:
+        engine = get_recon_engine()
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'databases': {
+                'oscar': 'connected',
+                'copper': 'connected',
+                'edb': 'connected',
+                'star': 'connected'
             }
-        }
-        
-        function showError(message) {
-            const errorContainer = document.getElementById('error-container');
-            errorContainer.innerHTML = `
-                <div class="alert alert-error" style="animation: fadeInUp 0.3s ease-out;">
-                    <i class="fas fa-exclamation-triangle" style="margin-right: 0.5rem; font-size: 1.25rem;"></i>
-                    <strong>Error:</strong> ${message}
-                </div>
-            `;
-        }
-        
-        function clearError() {
-            const errorContainer = document.getElementById('error-container');
-            errorContainer.innerHTML = '';
-        }
-        
-        function downloadJSON(data, filename) {
-            const blob = new Blob([JSON.stringify(data, null, 2)], {
-                type: 'application/json'
-            });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            
-            showToast('✓ Results exported successfully!', 'success');
-        }
-        
-        function showToast(message, type = 'info') {
-            const toast = document.createElement('div');
-            
-            const colors = {
-                success: 'var(--success-color)',
-                error: 'var(--error-color)',
-                warning: 'var(--warning-color)',
-                info: 'var(--accent-color)'
-            };
-            
-            const icons = {
-                success: 'fa-check-circle',
-                error: 'fa-exclamation-circle',
-                warning: 'fa-exclamation-triangle',
-                info: 'fa-info-circle'
-            };
-            
-            toast.style.cssText = `
-                position: fixed;
-                top: 100px;
-                right: 30px;
-                background: linear-gradient(135deg, ${colors[type]}, ${colors[type]}dd);
-                color: white;
-                padding: 1.25rem 1.75rem;
-                border-radius: 1rem;
-                box-shadow: 0 15px 35px rgba(0,0,0,0.3);
-                z-index: 10000;
-                animation: slideInRight 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-                font-weight: 600;
-                display: flex;
-                align-items: center;
-                gap: 0.75rem;
-                border: 2px solid rgba(255,255,255,0.3);
-                min-width: 300px;
-            `;
-            
-            toast.innerHTML = `
-                <i class="fas ${icons[type]}" style="font-size: 1.5rem;"></i>
-                <span>${message}</span>
-            `;
-            
-            document.body.appendChild(toast);
-            
-            setTimeout(() => {
-                toast.style.animation = 'slideOutRight 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55)';
-                setTimeout(() => {
-                    document.body.removeChild(toast);
-                }, 400);
-            }, 3000);
-        }
-        
-        // Add animation styles
-        const style = document.createElement('style');
-        style.textContent = `
-            @keyframes slideInRight {
-                from {
-                    transform: translateX(400px);
-                    opacity: 0;
-                }
-                to {
-                    transform: translateX(0);
-                    opacity: 1;
-                }
-            }
-            @keyframes slideOutRight {
-                from {
-                    transform: translateX(0);
-                    opacity: 1;
-                }
-                to {
-                    transform: translateX(400px);
-                    opacity: 0;
-                }
-            }
-            @keyframes fadeInUp {
-                from {
-                    opacity: 0;
-                    transform: translateY(20px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
-        `;
-        document.head.appendChild(style);
-    </script>
-</body>
-</html>
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("OSCAR RECONCILIATION TOOL - STARTING")
+    print("=" * 60)
+    
+    # Check if certificate file exists
+    import os
+    cert_path = CA_CERT_PATH
+    if not os.path.exists(cert_path):
+        print(f"❌ ERROR: Certificate file not found at: {cert_path}")
+        print(f"   Please update CA_CERT_PATH in app.py to point to your new.pem file")
+        print(f"   Current working directory: {os.getcwd()}")
+        exit(1)
+    else:
+        print(f"✅ Certificate file found: {cert_path}")
+    
+    print("\n" + "=" * 60)
+    print("Initializing database connections...")
+    print("=" * 60)
+    
+    try:
+        # Try to initialize connections on startup
+        print("\n🔄 Testing database connections...")
+        engine = get_recon_engine()
+        print("✅ All database connections initialized successfully!\n")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to initialize connections on startup")
+        print(f"   Error: {str(e)}")
+        print(f"   The app will try to connect when first request is made.\n")
+    
+    print("=" * 60)
+    print("🚀 Starting Flask application...")
+    print("=" * 60)
+    print("\n📍 Access the application at: http://localhost:5000")
+    print("📍 Health check endpoint: http://localhost:5000/api/health")
+    print("\n⏹️  Press CTRL+C to stop the server\n")
+    print("=" * 60 + "\n")
+    
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=True)
+    except Exception as e:
+        print(f"\n❌ ERROR: Failed to start Flask app")
+        print(f"   {str(e)}")
+        exit(1)
+```
+
+## 🔍 Key Fixes in Backend:
+
+### 1. **XPath Column Names Fixed**
+The main issue was likely in the XPath extraction. I changed:
+```python
+# BEFORE (incorrect - was using capital letters inconsistently)
+(xpath('...')[1]::text as "GFID"
+
+# AFTER (correct - lowercase aliases)
+(xpath('...')[1]::text as gfid
+```
+
+### 2. **Added Comprehensive Logging**
+Every query now logs:
+- What it's searching for
+- The full query
+- The parameters
+- The results returned
+- Sample rows
+
+### 3. **Explicit Column Mapping in Queries**
+Made sure all queries explicitly name columns:
+```python
+# OSCAR query now explicitly returns:
+# - GUID (uppercase from DB)
+# - gfid (lowercase alias)
+# - gus_id (lowercase alias)
+# - exchange (lowercase alias)
+# - namespace
+# - status
+```
+
+### 4. **Removed Mixed Case Issues**
+All field names in results are now lowercase consistently:
+- `gfid` (not `GFID` or mixed)
+- `gus_id` (not `GUS_ID`)
+- `guid` (not `GUID`)
+
+## 🧪 Testing Steps:
+
+1. **Run the app:**
+```bash
+python3 app.py
+```
+
+2. **Check the logs when you search:**
+   - You should see: `OSCAR Query returned X rows`
+   - You should see: `Sample row: {'guid': '...', 'gfid': '...', 'gus_id': '...'}`
+
+3. **If OSCAR still returns only GUID:**
+   - Check the logs carefully
+   - The issue might be in the XML structure
+   - Try running this query directly in pgAdmin:
+
+```sql
+SELECT
+    GUID,
+    (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', XML))[1]::text as gfid,
+    (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', XML))[1]::text as gus_id,
+    namespace
+FROM dv01cosrs.active_xml_data_store
+WHERE GUID = 'NUEXKEUAEJIN'
+AND namespace = 'GlobexUserSignature'
+LIMIT 1;
+```
+
+4. **Check browser console:**
+   - Open Developer Tools (F12)
+   - Go to Console tab
+   - Look for any JavaScript errors
+
+## 📊 Debug Output to Check:
+
+When you run a search, you should see in terminal:
+```
+INFO - Reconciliation request: guid=ABCD1234, gfid=, gus_id=
+INFO - Executing OSCAR query with GUID: ABCD1234
+INFO - OSCAR Query returned 1 rows
+INFO - Sample row: {'guid': 'ABCD1234', 'gfid': 'TEST', 'gus_id': 'USR01', 'exchange': 'CME', 'namespace': 'GlobexUserSignature', 'status': 'ACTIVE'}
+INFO - OSCAR results: [{'guid': 'ABCD1234', 'gfid': 'TEST', ...}]
+INFO - Executing CoPPER query with GUID: ABCD1234
+INFO - CoPPER Query returned 1 rows
+INFO - Sample row: {'guid': 'ABCD1234', 'gfid': 'TEST', 'gus_id': 'USR01', ...}
+```
+
+## 🔧 If Still Having Issues:
+
+### Option A: Test the OSCAR query independently
+Create a test script `test_oscar.py`:
+```python
+from app import DatabaseConnector
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+conn = DatabaseConnector('oscar')
+query = """
+SELECT
+    GUID,
+    (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', XML))[1]::text as gfid,
+    (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', XML))[1]::text as gus_id,
+    namespace
+FROM dv01cosrs.active_xml_data_store
+WHERE GUID = :guid
+AND namespace = 'GlobexUserSignature'
+LIMIT 1
+"""
+
+result = conn.execute_query(query, {'guid': 'NUEXKEUAEJIN'})
+print("Result:", result)
+```
+
+Run it:
+```bash
+python3 test_oscar.py
+```
+
+### Option B: Check XML structure
+The XML might have different structure. Add this debug query:
+```python
+def debug_xml_structure(self, guid: str):
+    query = """
+    SELECT XML::text
+    FROM dv01cosrs.active_xml_data_store
+    WHERE GUID = :guid
+    LIMIT 1
+    """
+    results = self.oscar_conn.execute_query(query, {'guid': guid})
+    if results:
+        print("XML Structure:")
+        print(results[0]['xml'])
+```
+
+This will show you the actual XML so we can fix the XPath if needed.
+
+### Option C: Simplify the query temporarily
+Try this simpler version to isolate the issue:
+```python
+def get_oscar_data_by_guid(self, guid: str) -> List[Dict]:
+    # Simplified query for testing
+    query = """
+    SELECT
+        GUID as guid,
+        namespace,
+        'test_gfid' as gfid,
+        'test_gus' as gus_id,
+        'ACTIVE' as status
+    FROM dv01cosrs.active_xml_data_store
+    WHERE GUID = :guid
+    AND namespace = 'GlobexUserSignature'
+    LIMIT 1
+    """
+    return self.oscar_conn.execute_query(query, {'guid': guid})
+```
+
+If this works (shows test data), then the issue is definitely in the XPath extraction.
+
+**Let me know what you see in the logs when you run a search!** That will tell us exactly where the problem is. 🔍
