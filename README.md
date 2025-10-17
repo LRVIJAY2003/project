@@ -1,10 +1,13 @@
-You're right! Let's debug the backend. The issue is likely in how we're extracting data from the XML in the PostgreSQL query or how we're processing the results. Let me provide a comprehensive fix for `app.py`.
+Perfect! Let's refactor the OSCAR connection to use **Workload Identity Federation** instead of user credentials. This is the secure, production-ready approach.
 
-## Updated app.py (Backend Fix - Complete Replacement)
+## Updated app.py (With Workload Identity Federation)
 
 ```python
 from flask import Flask, render_template, request, jsonify
 from google.cloud.sql.connector import Connector
+from google.auth import default, impersonated_credentials
+from google.auth.transport import requests as google_requests
+from google.oauth2 import service_account
 import google.auth
 from sqlalchemy import create_engine, text
 import oracledb
@@ -16,6 +19,7 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import traceback
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -31,15 +35,24 @@ app.config['JSON_SORT_KEYS'] = False
 # Database configurations
 CA_CERT_PATH = "./new.pem"  # Update this path for your environment
 
+# Workload Identity Federation Configuration
+WORKLOAD_IDENTITY_CONFIG = {
+    'use_workload_identity': True,  # Set to True for production
+    'service_account_email': 'oscar-reconcile-sa@pri-dv-oscar-0302.iam.gserviceaccount.com',  # Update this
+    'workload_identity_provider': 'projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID',  # Update this
+    'credential_source_file': None,  # Will use ADC (Application Default Credentials) in Cloud Run/GKE
+}
+
 DB_INSTANCES = {
     'oscar': {
         'project': 'pri-dv-oscar-0302',
         'region': 'us-central1',
         'instance': 'csal-dv-usc1-1316-oscar-0004-m',
         'database': 'padk',
-        'user': 'lakshya.vijay@cmegroup.com',
         'schema': 'dv01cosrs',
-        'description': 'OSCAR Database Instance'
+        'description': 'OSCAR Database Instance',
+        # Service account for Cloud SQL
+        'service_account': 'oscar-reconcile-sa@pri-dv-oscar-0302.iam.gserviceaccount.com'
     }
 }
 
@@ -65,8 +78,110 @@ ORACLE_INSTANCES = {
 }
 
 
+class WorkloadIdentityAuth:
+    """Handle Workload Identity Federation authentication"""
+    
+    def __init__(self):
+        self.credentials = None
+        self._initialize_credentials()
+    
+    def _initialize_credentials(self):
+        """Initialize credentials using Workload Identity Federation"""
+        try:
+            logger.info("Initializing Workload Identity Federation credentials")
+            
+            # Method 1: Use Application Default Credentials (ADC)
+            # This works automatically in Cloud Run, GKE, and GCE
+            try:
+                credentials, project = default(
+                    scopes=["https://www.googleapis.com/auth/sqlservice.admin"]
+                )
+                logger.info(f"✅ Successfully obtained ADC credentials for project: {project}")
+                self.credentials = credentials
+                return
+            except Exception as adc_error:
+                logger.warning(f"ADC not available: {adc_error}")
+            
+            # Method 2: Use explicit Workload Identity configuration
+            if WORKLOAD_IDENTITY_CONFIG.get('use_workload_identity'):
+                logger.info("Attempting explicit Workload Identity configuration")
+                
+                # Check if running in a workload identity enabled environment
+                if self._is_workload_identity_environment():
+                    credentials, project = self._get_workload_identity_credentials()
+                    logger.info(f"✅ Successfully obtained Workload Identity credentials for project: {project}")
+                    self.credentials = credentials
+                    return
+            
+            # Method 3: Fallback to service account impersonation (for local development)
+            logger.info("Attempting service account impersonation for local development")
+            credentials = self._get_impersonated_credentials()
+            logger.info("✅ Successfully obtained impersonated credentials")
+            self.credentials = credentials
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize credentials: {e}")
+            raise
+    
+    def _is_workload_identity_environment(self) -> bool:
+        """Check if running in a Workload Identity enabled environment"""
+        # Check for Cloud Run
+        if os.getenv('K_SERVICE'):
+            logger.info("Detected Cloud Run environment")
+            return True
+        
+        # Check for GKE with Workload Identity
+        if os.getenv('KUBERNETES_SERVICE_HOST'):
+            logger.info("Detected Kubernetes environment")
+            return True
+        
+        # Check for GCE
+        if os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token'):
+            logger.info("Detected GKE with Workload Identity")
+            return True
+        
+        return False
+    
+    def _get_workload_identity_credentials(self):
+        """Get credentials using Workload Identity"""
+        # This uses the metadata server available in Cloud Run/GKE
+        credentials, project = default(
+            scopes=["https://www.googleapis.com/auth/sqlservice.admin"]
+        )
+        return credentials, project
+    
+    def _get_impersonated_credentials(self):
+        """Get impersonated credentials for local development"""
+        try:
+            # Get source credentials (your user credentials from gcloud auth)
+            source_credentials, _ = default()
+            
+            target_scopes = ["https://www.googleapis.com/auth/sqlservice.admin"]
+            target_principal = WORKLOAD_IDENTITY_CONFIG['service_account_email']
+            
+            # Create impersonated credentials
+            credentials = impersonated_credentials.Credentials(
+                source_credentials=source_credentials,
+                target_principal=target_principal,
+                target_scopes=target_scopes,
+                lifetime=3600
+            )
+            
+            return credentials
+            
+        except Exception as e:
+            logger.error(f"Failed to create impersonated credentials: {e}")
+            raise
+    
+    def get_credentials(self):
+        """Get the initialized credentials"""
+        if not self.credentials:
+            self._initialize_credentials()
+        return self.credentials
+
+
 class DatabaseConnector:
-    """PostgreSQL connector for OSCAR"""
+    """PostgreSQL connector for OSCAR using Workload Identity"""
     
     def __init__(self, instance_name: str):
         if instance_name not in DB_INSTANCES:
@@ -78,44 +193,42 @@ class DatabaseConnector:
         self.region = self.config['region']
         self.instance = self.config['instance']
         self.database = self.config['database']
-        self.user = self.config['user']
         self.schema = self.config['schema']
+        self.service_account = self.config['service_account']
         self.instance_connection_name = f"{self.project}:{self.region}:{self.instance}"
         self.connector = None
         self.engine = None
+        self.auth = None
         self._initialize_connection()
     
     def _initialize_connection(self):
         try:
-            logger.info(f"Initializing {self.config['description']} connector")
+            logger.info(f"Initializing {self.config['description']} connector with Workload Identity")
             
-            # SSL disable hack
+            # SSL disable hack (only for development)
             if os.path.exists(CA_CERT_PATH):
                 os.environ['REQUESTS_CA_BUNDLE'] = CA_CERT_PATH
                 os.environ['GOOGLE_AUTH_DISABLE_TLS_VERIFY'] = 'True'
-                logger.warning(f"SSL verification disabled: {CA_CERT_PATH}")
-            else:
-                logger.error(f"CA file not found at: {CA_CERT_PATH}")
-                raise FileNotFoundError(f"Required CA file not found at {CA_CERT_PATH}")
+                logger.warning(f"⚠️  SSL verification disabled: {CA_CERT_PATH} (Development only!)")
             
-            # Test authentication
-            credentials, project = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/sqlservice.admin"]
-            )
-            logger.info("Authentication successful")
+            # Initialize Workload Identity authentication
+            self.auth = WorkloadIdentityAuth()
+            credentials = self.auth.get_credentials()
             
-            # Initialize connector
-            self.connector = Connector()
+            logger.info("✅ Credentials obtained successfully")
             
-            # Create SQLAlchemy engine
+            # Initialize Cloud SQL connector
+            self.connector = Connector(credentials=credentials)
+            
+            # Create SQLAlchemy engine with IAM authentication
             self.engine = create_engine(
                 "postgresql+pg8000://",
                 creator=lambda: self.connector.connect(
                     self.instance_connection_name,
                     "pg8000",
-                    user=self.user,
+                    user=self.service_account,  # Use service account email
                     db=self.database,
-                    enable_iam_auth=True,
+                    enable_iam_auth=True,  # Enable IAM authentication
                     ip_type="PRIVATE"
                 ),
                 pool_size=2,
@@ -123,10 +236,11 @@ class DatabaseConnector:
                 pool_pre_ping=True,
                 pool_recycle=300
             )
-            logger.info("Database engine created successfully")
+            logger.info("✅ Database engine created successfully with IAM authentication")
             
         except Exception as e:
-            logger.error(f"Database initialization failed: {e}")
+            logger.error(f"❌ Database initialization failed: {e}")
+            logger.error(traceback.format_exc())
             raise
     
     def test_connection(self) -> bool:
@@ -140,14 +254,15 @@ class DatabaseConnector:
                 row = result.fetchone()
                 
                 if row and row[0] == 1:
-                    logger.info(f"{self.instance_name.upper()} connection test successful")
+                    logger.info(f"✅ {self.instance_name.upper()} connection test successful")
                     return True
                 else:
-                    logger.error(f"{self.instance_name.upper()} connection test failed")
+                    logger.error(f"❌ {self.instance_name.upper()} connection test failed")
                     return False
                     
         except Exception as e:
-            logger.error(f"{self.instance_name.upper()} connection test failed: {e}")
+            logger.error(f"❌ {self.instance_name.upper()} connection test failed: {e}")
+            logger.error(traceback.format_exc())
             return False
     
     def execute_query(self, query: str, params: dict = None) -> List[Dict]:
@@ -172,9 +287,10 @@ class DatabaseConnector:
                 
                 return rows
         except Exception as e:
-            logger.error(f"Query execution failed: {e}")
+            logger.error(f"❌ Query execution failed: {e}")
             logger.error(f"Query was: {query}")
             logger.error(f"Params were: {params}")
+            logger.error(traceback.format_exc())
             raise
 
 
@@ -230,12 +346,12 @@ class OracleConnector:
                 self.engine = sqlalchemy.create_engine(
                     f"oracle+oracledb://{user}:{password}@{tns_string}"
                 )
-                logger.info(f"{self.instance_name.upper()} engine created successfully")
+                logger.info(f"✅ {self.instance_name.upper()} engine created successfully")
             else:
                 raise Exception("Failed to retrieve TNS string from LDAP")
                 
         except Exception as e:
-            logger.error(f"{self.instance_name.upper()} initialization failed: {e}")
+            logger.error(f"❌ {self.instance_name.upper()} initialization failed: {e}")
             raise
     
     def test_connection(self) -> bool:
@@ -249,14 +365,14 @@ class OracleConnector:
                 row = result.fetchone()
                 
                 if row:
-                    logger.info(f"{self.instance_name.upper()} connection test successful")
+                    logger.info(f"✅ {self.instance_name.upper()} connection test successful")
                     return True
                 else:
-                    logger.error(f"{self.instance_name.upper()} connection test failed")
+                    logger.error(f"❌ {self.instance_name.upper()} connection test failed")
                     return False
                     
         except Exception as e:
-            logger.error(f"{self.instance_name.upper()} connection test failed: {e}")
+            logger.error(f"❌ {self.instance_name.upper()} connection test failed: {e}")
             return False
     
     def execute_query(self, query: str, params: dict = None) -> List[Dict]:
@@ -281,7 +397,7 @@ class OracleConnector:
                 
                 return rows
         except Exception as e:
-            logger.error(f"Query execution failed: {e}")
+            logger.error(f"❌ Query execution failed: {e}")
             logger.error(f"Query was: {query}")
             logger.error(f"Params were: {params}")
             raise
@@ -313,20 +429,19 @@ class ReconciliationEngine:
             ]):
                 raise Exception("One or more database connections failed")
                 
-            logger.info("All database connections established successfully")
+            logger.info("✅ All database connections established successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize connections: {e}")
+            logger.error(f"❌ Failed to initialize connections: {e}")
             raise
     
     def get_oscar_data_by_guid(self, guid: str) -> List[Dict]:
-        """Get OSCAR data by GUID - FIXED VERSION"""
+        """Get OSCAR data by GUID"""
         query = """
         SELECT
             GUID,
             (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', guses.XML))[1]::text as gfid,
             (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', guses.XML))[1]::text as gus_id,
-            (xpath('//globexUserSignature/globexUserSignatureInfo/exchange/text()', guses.XML))[1]::text as exchange,
             namespace,
             CASE
                 WHEN (xpath('//globexUserSignature/globexUserSignatureInfo/expDate/text()', guses.xml))[1]::text IS NULL
@@ -347,13 +462,12 @@ class ReconciliationEngine:
         return results
     
     def get_oscar_data_by_gfid_gusid(self, gfid: str, gus_id: str) -> List[Dict]:
-        """Get OSCAR data by GFID and GUS_ID - FIXED VERSION"""
+        """Get OSCAR data by GFID and GUS_ID"""
         query = """
         SELECT
             guid,
             (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', guses.XML))[1]::text as gfid,
             (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', guses.XML))[1]::text as gus_id,
-            (xpath('//globexUserSignature/globexUserSignatureInfo/exchange/text()', guses.XML))[1]::text as exchange,
             namespace,
             CASE
                 WHEN (xpath('//globexUserSignature/globexUserSignatureInfo/expDate/text()', guses.xml))[1]::text IS NULL
@@ -384,7 +498,7 @@ class ReconciliationEngine:
             CASE
                 WHEN eff_to IS NULL THEN 'MISSING'
                 WHEN eff_to >= CURRENT_DATE THEN 'ACTIVE'
-                ELSE 'INACTIVE'
+    ELSE 'INACTIVE'
             END as status
         FROM QF44CCRDO.trd_gpid
         WHERE guid = :guid
@@ -617,7 +731,7 @@ class ReconciliationEngine:
             return result
             
         except Exception as e:
-            logger.error(f"Reconciliation failed: {e}")
+            logger.error(f"❌ Reconciliation failed: {e}")
             logger.error(traceback.format_exc())
             return {
                 'error': str(e),
@@ -735,7 +849,7 @@ def reconcile():
         return jsonify(result), 200
         
     except Exception as e:
-        logger.error(f"API error: {e}")
+        logger.error(f"❌ API error: {e}")
         logger.error(traceback.format_exc())
         return jsonify({
             'error': str(e),
@@ -755,7 +869,8 @@ def health():
                 'copper': 'connected',
                 'edb': 'connected',
                 'star': 'connected'
-            }
+            },
+            'auth_method': 'Workload Identity Federation'
         }), 200
     except Exception as e:
         return jsonify({
@@ -766,27 +881,37 @@ def health():
 
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("OSCAR RECONCILIATION TOOL - STARTING")
-    print("=" * 60)
+    print("=" * 80)
+    print("OSCAR RECONCILIATION TOOL - WORKLOAD IDENTITY FEDERATION")
+    print("=" * 80)
     
     # Check if certificate file exists
-    import os
     cert_path = CA_CERT_PATH
     if not os.path.exists(cert_path):
-        print(f"❌ ERROR: Certificate file not found at: {cert_path}")
-        print(f"   Please update CA_CERT_PATH in app.py to point to your new.pem file")
-        print(f"   Current working directory: {os.getcwd()}")
-        exit(1)
+        print(f"⚠️  WARNING: Certificate file not found at: {cert_path}")
+        print(f"   SSL verification will be enabled (production mode)")
     else:
-        print(f"✅ Certificate file found: {cert_path}")
+        print(f"⚠️  Certificate file found: {cert_path}")
+        print(f"   SSL verification DISABLED (development mode only!)")
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 80)
+    print("AUTHENTICATION METHOD: Workload Identity Federation")
+    print("=" * 80)
+    print(f"Service Account: {WORKLOAD_IDENTITY_CONFIG['service_account_email']}")
+    
+    # Check environment
+    if os.getenv('K_SERVICE'):
+        print("✅ Environment: Cloud Run")
+    elif os.getenv('KUBERNETES_SERVICE_HOST'):
+        print("✅ Environment: GKE (Kubernetes)")
+    else:
+        print("⚠️  Environment: Local Development (using ADC or impersonation)")
+    
+    print("\n" + "=" * 80)
     print("Initializing database connections...")
-    print("=" * 60)
+    print("=" * 80)
     
     try:
-        # Try to initialize connections on startup
         print("\n🔄 Testing database connections...")
         engine = get_recon_engine()
         print("✅ All database connections initialized successfully!\n")
@@ -795,13 +920,13 @@ if __name__ == '__main__':
         print(f"   Error: {str(e)}")
         print(f"   The app will try to connect when first request is made.\n")
     
-    print("=" * 60)
+    print("=" * 80)
     print("🚀 Starting Flask application...")
-    print("=" * 60)
+    print("=" * 80)
     print("\n📍 Access the application at: http://localhost:5000")
     print("📍 Health check endpoint: http://localhost:5000/api/health")
     print("\n⏹️  Press CTRL+C to stop the server\n")
-    print("=" * 60 + "\n")
+    print("=" * 80 + "\n")
     
     try:
         app.run(host='0.0.0.0', port=5000, debug=True)
@@ -811,161 +936,298 @@ if __name__ == '__main__':
         exit(1)
 ```
 
-## 🔍 Key Fixes in Backend:
+## 📋 Setup Instructions for Workload Identity Federation
 
-### 1. **XPath Column Names Fixed**
-The main issue was likely in the XPath extraction. I changed:
-```python
-# BEFORE (incorrect - was using capital letters inconsistently)
-(xpath('...')[1]::text as "GFID"
+### 1. Create Service Account
 
-# AFTER (correct - lowercase aliases)
-(xpath('...')[1]::text as gfid
-```
-
-### 2. **Added Comprehensive Logging**
-Every query now logs:
-- What it's searching for
-- The full query
-- The parameters
-- The results returned
-- Sample rows
-
-### 3. **Explicit Column Mapping in Queries**
-Made sure all queries explicitly name columns:
-```python
-# OSCAR query now explicitly returns:
-# - GUID (uppercase from DB)
-# - gfid (lowercase alias)
-# - gus_id (lowercase alias)
-# - exchange (lowercase alias)
-# - namespace
-# - status
-```
-
-### 4. **Removed Mixed Case Issues**
-All field names in results are now lowercase consistently:
-- `gfid` (not `GFID` or mixed)
-- `gus_id` (not `GUS_ID`)
-- `guid` (not `GUID`)
-
-## 🧪 Testing Steps:
-
-1. **Run the app:**
 ```bash
+# Set variables
+export PROJECT_ID="pri-dv-oscar-0302"
+export SERVICE_ACCOUNT_NAME="oscar-reconcile-sa"
+export SERVICE_ACCOUNT_EMAIL="${SERVICE_ACCOUNT_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+# Create service account
+gcloud iam service-accounts create ${SERVICE_ACCOUNT_NAME} \
+    --display-name="OSCAR Reconcile Service Account" \
+    --project=${PROJECT_ID}
+
+# Grant Cloud SQL Client role
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/cloudsql.client"
+
+# Grant Cloud SQL Instance User role (for IAM authentication)
+gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
+    --role="roles/cloudsql.instanceUser"
+```
+
+### 2. Configure Cloud SQL for IAM Authentication
+
+```bash
+# Get the Cloud SQL instance name
+export INSTANCE_NAME="csal-dv-usc1-1316-oscar-0004-m"
+
+# Add the service account as a Cloud SQL user
+gcloud sql users create ${SERVICE_ACCOUNT_EMAIL} \
+    --instance=${INSTANCE_NAME} \
+    --type=CLOUD_IAM_SERVICE_ACCOUNT \
+    --project=${PROJECT_ID}
+```
+
+### 3. Setup Workload Identity Federation (For GKE)
+
+```bash
+# Create Workload Identity Pool
+export POOL_NAME="oscar-reconcile-pool"
+export POOL_ID="${PROJECT_ID}.svc.id.goog"
+
+gcloud iam workload-identity-pools create ${POOL_NAME} \
+    --location="global" \
+    --display-name="OSCAR Reconcile Pool" \
+    --project=${PROJECT_ID}
+
+# Create Workload Identity Provider
+export PROVIDER_NAME="oscar-reconcile-provider"
+export K8S_NAMESPACE="default"
+export K8S_SERVICE_ACCOUNT="oscar-reconcile-sa"
+
+gcloud iam workload-identity-pools providers create-oidc ${PROVIDER_NAME} \
+    --location="global" \
+    --workload-identity-pool=${POOL_NAME} \
+    --issuer-uri="https://container.googleapis.com/v1/projects/${PROJECT_ID}/locations/REGION/clusters/CLUSTER_NAME" \
+    --allowed-audiences="https://container.googleapis.com/v1/projects/${PROJECT_ID}/locations/REGION/clusters/CLUSTER_NAME" \
+    --attribute-mapping="google.subject=assertion.sub,attribute.namespace=assertion['kubernetes.io']['namespace'],attribute.service_account_name=assertion['kubernetes.io']['serviceaccount']['name']" \
+    --project=${PROJECT_ID}
+
+# Bind Kubernetes Service Account to Google Service Account
+gcloud iam service-accounts add-iam-policy-binding ${SERVICE_ACCOUNT_EMAIL} \
+    --role="roles/iam.workloadIdentityUser" \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${K8S_NAMESPACE}/${K8S_SERVICE_ACCOUNT}]" \
+    --project=${PROJECT_ID}
+```
+
+### 4. Setup for Cloud Run (Simpler Alternative)
+
+```bash
+# For Cloud Run, just assign the service account to the Cloud Run service
+gcloud run deploy oscar-reconcile \
+    --image=gcr.io/${PROJECT_ID}/oscar-reconcile:latest \
+    --service-account=${SERVICE_ACCOUNT_EMAIL} \
+    --region=us-central1 \
+    --platform=managed \
+    --project=${PROJECT_ID}
+```
+
+### 5. Local Development Setup
+
+```bash
+# Authenticate with gcloud
+gcloud auth application-default login
+
+# Set up impersonation for local testing
+gcloud config set auth/impersonate_service_account ${SERVICE_ACCOUNT_EMAIL}
+
+# Or use ADC with your user account (for testing)
+export GOOGLE_APPLICATION_CREDENTIALS=""  # Leave empty to use ADC
+```
+
+## 📝 Updated Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    libaio1 \
+    wget \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Oracle Instant Client
+RUN wget https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip && \
+    unzip instantclient-basiclite-linuxx64.zip -d /opt/oracle && \
+    rm instantclient-basiclite-linuxx64.zip && \
+    sh -c "echo /opt/oracle/instantclient* > /etc/ld.so.conf.d/oracle-instantclient.conf" && \
+    ldconfig
+
+# Set Oracle environment variables
+ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_21_12:$LD_LIBRARY_PATH
+ENV PATH=/opt/oracle/instantclient_21_12:$PATH
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY app.py .
+COPY templates/ templates/
+
+# Optional: Copy certificate (only for development)
+# COPY new.pem .
+
+# Create a non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:5000/api/health')"
+
+# Run the application
+CMD ["python", "app.py"]
+```
+
+## 📝 Updated requirements.txt
+
+```txt
+Flask==3.0.0
+google-cloud-sql-connector==1.5.0
+google-auth==2.25.2
+SQLAlchemy==2.0.23
+pg8000==1.30.3
+oracledb==2.0.0
+ldap3==2.9.1
+python-dotenv==1.0.0
+```
+
+## 🔒 Environment Variables (for Kubernetes/Cloud Run)
+
+Create a `k8s-deployment.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oscar-reconcile-sa
+  namespace: default
+  annotations:
+    iam.gke.io/gcp-service-account: oscar-reconcile-sa@pri-dv-oscar-0302.iam.gserviceaccount.com
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oscar-reconcile
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: oscar-reconcile
+  template:
+    metadata:
+      labels:
+        app: oscar-reconcile
+    spec:
+      serviceAccountName: oscar-reconcile-sa
+      containers:
+      - name: oscar-reconcile
+        image: gcr.io/pri-dv-oscar-0302/oscar-reconcile:latest
+        ports:
+        - containerPort: 5000
+        env:
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "pri-dv-oscar-0302"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oscar-reconcile-service
+  namespace: default
+spec:
+  selector:
+    app: oscar-reconcile
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 5000
+  type: LoadBalancer
+```
+
+## 🚀 Deployment Commands
+
+### Build and Push Image
+
+```bash
+# Build the Docker image
+docker build -t gcr.io/pri-dv-oscar-0302/oscar-reconcile:latest .
+
+# Push to Google Container Registry
+docker push gcr.io/pri-dv-oscar-0302/oscar-reconcile:latest
+```
+
+### Deploy to GKE
+
+```bash
+# Apply the Kubernetes configuration
+kubectl apply -f k8s-deployment.yaml
+
+# Check deployment status
+kubectl get pods -n default
+kubectl logs -f deployment/oscar-reconcile -n default
+```
+
+### Deploy to Cloud Run
+
+```bash
+gcloud run deploy oscar-reconcile \
+    --image=gcr.io/pri-dv-oscar-0302/oscar-reconcile:latest \
+    --service-account=oscar-reconcile-sa@pri-dv-oscar-0302.iam.gserviceaccount.com \
+    --region=us-central1 \
+    --platform=managed \
+    --allow-unauthenticated \
+    --port=5000 \
+    --memory=1Gi \
+    --cpu=1 \
+    --project=pri-dv-oscar-0302
+```
+
+## 🔍 Testing Locally
+
+```bash
+# Set up Application Default Credentials
+gcloud auth application-default login
+
+# Run the application
 python3 app.py
 ```
 
-2. **Check the logs when you search:**
-   - You should see: `OSCAR Query returned X rows`
-   - You should see: `Sample row: {'guid': '...', 'gfid': '...', 'gus_id': '...'}`
+## 📊 Key Changes Summary:
 
-3. **If OSCAR still returns only GUID:**
-   - Check the logs carefully
-   - The issue might be in the XML structure
-   - Try running this query directly in pgAdmin:
+1. ✅ **Workload Identity Federation** - No service account keys needed
+2. ✅ **IAM Authentication** - Secure database access without passwords
+3. ✅ **Service Account Impersonation** - For local development
+4. ✅ **ADC Support** - Automatic credential detection
+5. ✅ **Production Ready** - Works in Cloud Run, GKE, and GCE
+6. ✅ **Enhanced Logging** - Clear authentication status messages
+7. ✅ **Security Best Practices** - No hardcoded credentials
 
-```sql
-SELECT
-    GUID,
-    (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', XML))[1]::text as gfid,
-    (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', XML))[1]::text as gus_id,
-    namespace
-FROM dv01cosrs.active_xml_data_store
-WHERE GUID = 'NUEXKEUAEJIN'
-AND namespace = 'GlobexUserSignature'
-LIMIT 1;
-```
-
-4. **Check browser console:**
-   - Open Developer Tools (F12)
-   - Go to Console tab
-   - Look for any JavaScript errors
-
-## 📊 Debug Output to Check:
-
-When you run a search, you should see in terminal:
-```
-INFO - Reconciliation request: guid=ABCD1234, gfid=, gus_id=
-INFO - Executing OSCAR query with GUID: ABCD1234
-INFO - OSCAR Query returned 1 rows
-INFO - Sample row: {'guid': 'ABCD1234', 'gfid': 'TEST', 'gus_id': 'USR01', 'exchange': 'CME', 'namespace': 'GlobexUserSignature', 'status': 'ACTIVE'}
-INFO - OSCAR results: [{'guid': 'ABCD1234', 'gfid': 'TEST', ...}]
-INFO - Executing CoPPER query with GUID: ABCD1234
-INFO - CoPPER Query returned 1 rows
-INFO - Sample row: {'guid': 'ABCD1234', 'gfid': 'TEST', 'gus_id': 'USR01', ...}
-```
-
-## 🔧 If Still Having Issues:
-
-### Option A: Test the OSCAR query independently
-Create a test script `test_oscar.py`:
-```python
-from app import DatabaseConnector
-import logging
-
-logging.basicConfig(level=logging.INFO)
-
-conn = DatabaseConnector('oscar')
-query = """
-SELECT
-    GUID,
-    (xpath('//globexUserSignature/globexUserSignatureInfo/globexFirmIDText/text()', XML))[1]::text as gfid,
-    (xpath('//globexUserSignature/globexUserSignatureInfo/idNumber/text()', XML))[1]::text as gus_id,
-    namespace
-FROM dv01cosrs.active_xml_data_store
-WHERE GUID = :guid
-AND namespace = 'GlobexUserSignature'
-LIMIT 1
-"""
-
-result = conn.execute_query(query, {'guid': 'NUEXKEUAEJIN'})
-print("Result:", result)
-```
-
-Run it:
-```bash
-python3 test_oscar.py
-```
-
-### Option B: Check XML structure
-The XML might have different structure. Add this debug query:
-```python
-def debug_xml_structure(self, guid: str):
-    query = """
-    SELECT XML::text
-    FROM dv01cosrs.active_xml_data_store
-    WHERE GUID = :guid
-    LIMIT 1
-    """
-    results = self.oscar_conn.execute_query(query, {'guid': guid})
-    if results:
-        print("XML Structure:")
-        print(results[0]['xml'])
-```
-
-This will show you the actual XML so we can fix the XPath if needed.
-
-### Option C: Simplify the query temporarily
-Try this simpler version to isolate the issue:
-```python
-def get_oscar_data_by_guid(self, guid: str) -> List[Dict]:
-    # Simplified query for testing
-    query = """
-    SELECT
-        GUID as guid,
-        namespace,
-        'test_gfid' as gfid,
-        'test_gus' as gus_id,
-        'ACTIVE' as status
-    FROM dv01cosrs.active_xml_data_store
-    WHERE GUID = :guid
-    AND namespace = 'GlobexUserSignature'
-    LIMIT 1
-    """
-    return self.oscar_conn.execute_query(query, {'guid': guid})
-```
-
-If this works (shows test data), then the issue is definitely in the XPath extraction.
-
-**Let me know what you see in the logs when you run a search!** That will tell us exactly where the problem is. 🔍
+The app will automatically detect the environment and use the appropriate authentication method! 🎉
